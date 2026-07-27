@@ -1,0 +1,65 @@
+name: contribution-a
+
+active_learning:
+  rounds: 3
+  initial_images: 20
+  budget_per_round: 10
+  seeds: [0, 1, 2]
+
+acquisition:
+  strategies:
+    - random
+    - uncertainty
+    - uncertainty_novelty
+    - rarity
+    - rarity_coherence
+    - ungated_full
+    - full
+  uncertainty_mode: ambiguity
+  pseudo_label_source: cluster
+  cluster_count: 20
+  neighbour_count: 5
+  top_k: 3
+  weights:
+    uncertainty: 0.3
+    novelty: 0.2
+    rarity: 0.5
+    coherence_power: 1.0
+    rarity_power: 1.0
+
+dataset:
+  image_set_path: /path/to/PROB/data/OWOD/ImageSets/OWDETR/t1_train.txt
+  annotations_dir: /path/to/PROB/data/OWOD/Annotations
+  # Replace with the exact unknown classes for the OWOD task/protocol you run.
+  unknown_classes:
+    - REPLACE_WITH_UNKNOWN_CLASS
+  long_tail:
+    enabled: true
+    tail_max: 10
+    head_min: 100
+    head_retention: 1.0
+    medium_retention: 0.4
+    tail_retention: 0.1
+
+prob:
+  repository_path: /path/to/PROB
+  initial_checkpoint: /path/to/PROB/exps/MOWODB/PROB/t1.pth
+  train_command: >-
+    python daowod_prob_bridge.py train
+    --labelled-ids {labelled_ids}
+    --previous-checkpoint {previous_checkpoint}
+    --output-checkpoint {checkpoint}
+    --output-dir {output_dir}
+    --seed {seed}
+  predict_command: >-
+    python daowod_prob_bridge.py predict
+    --image-ids {image_ids}
+    --checkpoint {checkpoint}
+    --output {proposals}
+  evaluate_command: >-
+    python daowod_prob_bridge.py evaluate
+    --checkpoint {checkpoint}
+    --output {metrics}
+  timeout_seconds: 86400
+
+output_dir: outputs/contribution-a
