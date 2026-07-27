@@ -2,6 +2,7 @@
 
 import csv
 import json
+import random
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,11 +11,12 @@ import numpy as np
 
 from daowod.acquisition import (
     AcquisitionResult,
+    aggregate_image_scores,
     score_proposals,
     select_images,
 )
-from daowod.config import ExperimentConfig
-from daowod.dataset import DatasetState, build_long_tail_pool, read_image_ids
+from daowod.config import AcquisitionConfig, ExperimentConfig
+from daowod.dataset import DatasetState, build_long_tail_pool, file_sha256, read_image_ids
 from daowod.metrics import grouped_unknown_recall, load_detection_json
 from daowod.prob_adapter import ProbAdapter
 
@@ -26,6 +28,275 @@ class ExperimentResult:
     metrics: list[dict[str, object]]
     selections: list[dict[str, object]]
     output_dir: Path
+
+
+def _unique_ids(name: str, values: Sequence[str]) -> list[str]:
+    ids = [str(value) for value in values]
+    if len(ids) != len(set(ids)):
+        raise ValueError(f"{name} must contain unique image IDs.")
+    return ids
+
+
+def _write_ids(path: Path, image_ids: Sequence[str]) -> None:
+    text = "\n".join(image_ids)
+    if image_ids:
+        text += "\n"
+    path.write_text(text, encoding="utf-8")
+
+
+def _write_json(path: Path, data: dict[str, object]) -> None:
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
+def _write_full_score_tables(
+    proposal_path: Path,
+    image_path: Path,
+    image_scores: dict[object, float],
+    proposal_image_ids: Sequence[object],
+    result: AcquisitionResult,
+    *,
+    coherence_power: float,
+) -> None:
+    with proposal_path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(
+            file,
+            fieldnames=[
+                "image_id",
+                "uncertainty",
+                "novelty",
+                "rarity",
+                "coherence",
+                "rarity_bonus",
+                "score",
+            ],
+            lineterminator="\n",
+        )
+        writer.writeheader()
+        for index, image_id in enumerate(proposal_image_ids):
+            rarity_bonus = result.rarity[index] * result.coherence[index] ** coherence_power
+            writer.writerow(
+                {
+                    "image_id": str(image_id),
+                    "uncertainty": float(result.uncertainty[index]),
+                    "novelty": float(result.novelty[index]),
+                    "rarity": float(result.rarity[index]),
+                    "coherence": float(result.coherence[index]),
+                    "rarity_bonus": float(rarity_bonus),
+                    "score": float(result.scores[index]),
+                }
+            )
+
+    with image_path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(
+            file,
+            fieldnames=["image_id", "score"],
+            lineterminator="\n",
+        )
+        writer.writeheader()
+        for image_id, score in sorted(
+            image_scores.items(), key=lambda item: (-item[1], str(item[0]))
+        ):
+            writer.writerow({"image_id": str(image_id), "score": float(score)})
+
+
+def run_active_round(
+    *,
+    adapter: ProbAdapter,
+    checkpoint: str | Path,
+    candidate_ids: Sequence[str],
+    reference_ids: Sequence[str],
+    labelled_ids: Sequence[str],
+    output_dir: str | Path,
+    strategy: str,
+    budget: int,
+    acquisition_config: AcquisitionConfig,
+    seed: int,
+    round_index: int = 0,
+) -> dict[str, object]:
+    """Run one detector-backed active-learning round."""
+
+    if strategy not in {"random", "full"}:
+        raise ValueError("strategy must be 'random' or 'full'.")
+    if budget < 1:
+        raise ValueError("budget must be positive.")
+
+    candidates = _unique_ids("candidate_ids", candidate_ids)
+    references = _unique_ids("reference_ids", reference_ids)
+    labelled = _unique_ids("labelled_ids", labelled_ids)
+    if budget > len(candidates):
+        raise ValueError("budget must not exceed candidate image count.")
+    if strategy == "full" and not references:
+        raise ValueError("reference_ids must be non-empty for full scoring.")
+    overlap = set(candidates) & set(references)
+    if overlap:
+        raise ValueError(f"candidate_ids and reference_ids must not overlap: {sorted(overlap)}")
+    labelled_overlap = set(candidates) & set(labelled)
+    if labelled_overlap:
+        raise ValueError(
+            f"candidate_ids and labelled_ids must not overlap: {sorted(labelled_overlap)}"
+        )
+
+    round_dir = Path(output_dir)
+    manifest_path = round_dir / "round_manifest.json"
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("completed") is True:
+            raise ValueError(f"Completed round would be overwritten: {round_dir}")
+    round_dir.mkdir(parents=True, exist_ok=True)
+
+    candidate_proposals_path = round_dir / "candidate_proposals.npz"
+    reference_proposals_path = round_dir / "reference_proposals.npz"
+    proposal_scores_path = round_dir / "proposal_scores.csv"
+    image_scores_path = round_dir / "image_scores.csv"
+    selected_path = round_dir / "selected_ids.txt"
+    labelled_path = round_dir / "labelled_ids.txt"
+    remaining_path = round_dir / "remaining_pool_ids.txt"
+    checkpoint_path = round_dir / "checkpoint.pth"
+    metrics_path = round_dir / "metrics.json"
+
+    manifest: dict[str, object] = {
+        "protocol_version": 1,
+        "round_index": round_index,
+        "strategy": strategy,
+        "seed": seed,
+        "budget": budget,
+        "input_checkpoint": str(checkpoint),
+        "output_checkpoint": checkpoint_path.name,
+        "candidate_count_before": len(candidates),
+        "labelled_count_before": len(labelled),
+        "reference_count": len(references),
+        "acquisition_parameters": {
+            "uncertainty_mode": acquisition_config.uncertainty_mode,
+            "pseudo_label_source": acquisition_config.pseudo_label_source,
+            "cluster_count": acquisition_config.cluster_count,
+            "neighbour_count": acquisition_config.neighbour_count,
+            "weights": vars(acquisition_config.weights),
+        },
+        "image_aggregation": {
+            "method": "mean_top_k_proposal_scores",
+            "top_k": acquisition_config.top_k,
+        },
+        "completed": False,
+    }
+    _write_json(manifest_path, manifest)
+
+    try:
+        candidate_batch = adapter.predict(
+            candidates,
+            checkpoint=checkpoint,
+            output_path=candidate_proposals_path,
+        )
+    except Exception as exc:
+        raise RuntimeError("candidate proposal export failed") from exc
+
+    selected: list[str]
+    if strategy == "random":
+        shuffled = list(candidates)
+        random.Random(f"{seed}:{round_index}").shuffle(shuffled)
+        selected = shuffled[:budget]
+    else:
+        try:
+            reference_batch = adapter.predict(
+                references,
+                checkpoint=checkpoint,
+                output_path=reference_proposals_path,
+            )
+        except Exception as exc:
+            raise RuntimeError("reference proposal export failed") from exc
+
+        try:
+            acquisition = score_proposals(
+                strategy="full",
+                uncertainty_mode=acquisition_config.uncertainty_mode,
+                pseudo_label_source=acquisition_config.pseudo_label_source,
+                confidence=candidate_batch.confidence,
+                posterior=candidate_batch.posterior,
+                embeddings=candidate_batch.embeddings,
+                reference_embeddings=reference_batch.embeddings,
+                predicted_labels=candidate_batch.predicted_labels,
+                cluster_count=acquisition_config.cluster_count,
+                neighbour_count=acquisition_config.neighbour_count,
+                seed=seed + round_index,
+                weights=acquisition_config.weights,
+            )
+            image_scores = aggregate_image_scores(
+                candidate_batch.image_ids,
+                acquisition.scores,
+                top_k=acquisition_config.top_k,
+            )
+        except Exception as exc:
+            raise RuntimeError("proposal scoring failed") from exc
+
+        _write_full_score_tables(
+            proposal_scores_path,
+            image_scores_path,
+            image_scores,
+            candidate_batch.image_ids,
+            acquisition,
+            coherence_power=acquisition_config.weights.coherence_power,
+        )
+        selected = [
+            str(image_id)
+            for image_id in select_images(
+                candidate_batch.image_ids,
+                acquisition.scores,
+                budget=budget,
+                top_k=acquisition_config.top_k,
+            )
+        ]
+
+    selected_set = set(selected)
+    cumulative_labelled = [*labelled, *selected]
+    remaining = [image_id for image_id in candidates if image_id not in selected_set]
+    _write_ids(selected_path, selected)
+    _write_ids(labelled_path, cumulative_labelled)
+    _write_ids(remaining_path, remaining)
+
+    try:
+        trained_checkpoint = adapter.train(
+            cumulative_labelled,
+            previous_checkpoint=checkpoint,
+            run_dir=round_dir,
+            round_index=round_index,
+            seed=seed,
+        )
+    except Exception as exc:
+        raise RuntimeError("training failed") from exc
+    if Path(trained_checkpoint) != checkpoint_path:
+        raise ValueError(f"Unexpected checkpoint path: {trained_checkpoint}")
+
+    try:
+        metrics = adapter.evaluate(checkpoint=checkpoint_path, output_path=metrics_path)
+    except Exception as exc:
+        raise RuntimeError("evaluation failed") from exc
+
+    manifest.update(
+        {
+            "candidate_count_after": len(remaining),
+            "labelled_count_after": len(cumulative_labelled),
+            "selected_ids_sha256": file_sha256(selected_path),
+            "remaining_pool_sha256": file_sha256(remaining_path),
+            "labelled_ids_sha256": file_sha256(labelled_path),
+            "candidate_proposals_sha256": file_sha256(candidate_proposals_path),
+            "reference_proposals_sha256": (
+                file_sha256(reference_proposals_path) if reference_proposals_path.exists() else None
+            ),
+            "metrics": metrics,
+            "completed": True,
+        }
+    )
+    _write_json(manifest_path, manifest)
+
+    return {
+        "selected_image_ids": selected,
+        "remaining_candidate_ids": remaining,
+        "labelled_ids": cumulative_labelled,
+        "checkpoint_path": checkpoint_path,
+        "metrics_path": metrics_path,
+        "round_manifest_path": manifest_path,
+    }
 
 
 class ActiveLearningExperiment:
@@ -40,20 +311,24 @@ class ActiveLearningExperiment:
 
         output_root = Path(self.config.output_dir)
         output_root.mkdir(parents=True, exist_ok=True)
-        base_image_ids = read_image_ids(self.config.dataset.image_set_path)
+        base_image_ids = (
+            []
+            if self.config.dataset.long_tail.enabled
+            else read_image_ids(self.config.dataset.image_set_path)
+        )
         metrics_rows: list[dict[str, object]] = []
         selection_rows: list[dict[str, object]] = []
 
         for seed in self.config.active_learning.seeds:
-            image_ids, class_groups = self._prepare_pool(
+            pool = self._prepare_pool(
                 base_image_ids,
                 seed=seed,
                 output_root=output_root,
             )
             for strategy in self.config.acquisition.strategies:
                 metrics, selections = self._run_single(
-                    image_ids,
-                    class_groups=class_groups,
+                    pool["selected_image_ids"],
+                    class_groups=pool["class_groups"],
                     seed=seed,
                     strategy=strategy,
                     output_root=output_root,
@@ -74,22 +349,24 @@ class ActiveLearningExperiment:
         *,
         seed: int,
         output_root: Path,
-    ) -> tuple[list[str], dict[str, str]]:
+    ) -> dict[str, object]:
         long_tail = self.config.dataset.long_tail
         if not long_tail.enabled:
-            return list(image_ids), {name: "medium" for name in self.config.dataset.unknown_classes}
+            return {
+                "selected_image_ids": list(image_ids),
+                "class_groups": {name: "medium" for name in self.config.dataset.unknown_classes},
+                "manifest_path": None,
+                "class_stats_path": None,
+                "pool_split_path": None,
+            }
 
         return build_long_tail_pool(
-            image_ids,
-            annotations_dir=self.config.dataset.annotations_dir,
-            unknown_classes=self.config.dataset.unknown_classes,
-            tail_max=long_tail.tail_max,
-            head_min=long_tail.head_min,
-            head_retention=long_tail.head_retention,
-            medium_retention=long_tail.medium_retention,
-            tail_retention=long_tail.tail_retention,
+            annotation_dir=self.config.dataset.annotations_dir,
+            source_split=self.config.dataset.image_set_path,
+            task_class_names=self.config.dataset.unknown_classes,
+            output_dir=output_root / f"long_tail_seed_{seed}",
+            imbalance_ratio=long_tail.imbalance_ratio,
             seed=seed,
-            manifest_path=output_root / f"long_tail_seed{seed}.json",
         )
 
     def _run_single(

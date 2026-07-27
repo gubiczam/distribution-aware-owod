@@ -11,13 +11,19 @@ from daowod.acquisition import AcquisitionWeights
 
 @dataclass(frozen=True)
 class ActiveLearningConfig:
-    rounds: int = 3
+    rounds: int = 1
+    strategy: str = "full"
+    budget: int = 10
     initial_images: int = 20
     budget_per_round: int = 10
     seeds: tuple[int, ...] = (0,)
 
     def __post_init__(self) -> None:
-        if self.rounds < 1 or self.initial_images < 1 or self.budget_per_round < 1:
+        if self.rounds != 1:
+            raise ValueError("Only one active-learning round is supported.")
+        if self.strategy not in {"random", "full"}:
+            raise ValueError("strategy must be random or full.")
+        if min(self.budget, self.initial_images, self.budget_per_round) < 1:
             raise ValueError("Active-learning values must be positive.")
         if not self.seeds:
             raise ValueError("At least one seed is required.")
@@ -57,18 +63,11 @@ class AcquisitionConfig:
 @dataclass(frozen=True)
 class LongTailConfig:
     enabled: bool = True
-    tail_max: int = 10
-    head_min: int = 100
-    head_retention: float = 1.0
-    medium_retention: float = 0.4
-    tail_retention: float = 0.1
+    imbalance_ratio: float = 50.0
 
     def __post_init__(self) -> None:
-        if self.tail_max < 0 or self.head_min <= self.tail_max:
-            raise ValueError("Invalid frequency thresholds.")
-        rates = (self.head_retention, self.medium_retention, self.tail_retention)
-        if any(rate < 0 or rate > 1 for rate in rates):
-            raise ValueError("Retention rates must be in [0, 1].")
+        if self.imbalance_ratio < 1:
+            raise ValueError("imbalance_ratio must be >= 1.")
 
 
 @dataclass(frozen=True)
@@ -139,7 +138,9 @@ def load_config(path: str | Path) -> ExperimentConfig:
     return ExperimentConfig(
         name=str(raw.get("name", "contribution-a")),
         active_learning=ActiveLearningConfig(
-            rounds=int(active.get("rounds", 3)),
+            rounds=int(active.get("rounds", 1)),
+            strategy=str(active.get("strategy", "full")),
+            budget=int(active.get("budget", 10)),
             initial_images=int(active.get("initial_images", 20)),
             budget_per_round=int(active.get("budget_per_round", 10)),
             seeds=tuple(int(seed) for seed in active.get("seeds", [0])),
@@ -159,11 +160,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
             unknown_classes=tuple(str(name) for name in dataset["unknown_classes"]),
             long_tail=LongTailConfig(
                 enabled=bool(long_tail.get("enabled", True)),
-                tail_max=int(long_tail.get("tail_max", 10)),
-                head_min=int(long_tail.get("head_min", 100)),
-                head_retention=float(long_tail.get("head_retention", 1.0)),
-                medium_retention=float(long_tail.get("medium_retention", 0.4)),
-                tail_retention=float(long_tail.get("tail_retention", 0.1)),
+                imbalance_ratio=float(long_tail.get("imbalance_ratio", 50.0)),
             ),
         ),
         prob=ProbConfig(

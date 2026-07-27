@@ -172,7 +172,9 @@ class ProbAdapter:
         )
         if not output.exists():
             raise FileNotFoundError(f"PROB did not create proposals: {output}")
-        return ProposalBatch.load(output)
+        proposals = ProposalBatch.load(output)
+        ids_path.unlink(missing_ok=True)
+        return proposals
 
     def evaluate(
         self,

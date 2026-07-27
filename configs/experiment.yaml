@@ -1,19 +1,12 @@
 name: contribution-a
 
 active_learning:
-  rounds: 3
-  initial_images: 20
-  budget_per_round: 10
-  seeds: [0, 1, 2]
+  rounds: 1
+  strategy: full
+  budget: 10
 
 acquisition:
   strategies:
-    - random
-    - uncertainty
-    - uncertainty_novelty
-    - rarity
-    - rarity_coherence
-    - ungated_full
     - full
   uncertainty_mode: ambiguity
   pseudo_label_source: cluster
@@ -35,11 +28,7 @@ dataset:
     - REPLACE_WITH_UNKNOWN_CLASS
   long_tail:
     enabled: true
-    tail_max: 10
-    head_min: 100
-    head_retention: 1.0
-    medium_retention: 0.4
-    tail_retention: 0.1
+    imbalance_ratio: 50.0
 
 prob:
   repository_path: /path/to/PROB

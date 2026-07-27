@@ -1,5 +1,11 @@
 """High-value smoke tests for contribution A."""
 
+import csv
+import io
+import json
+import random
+import zipfile
+from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
@@ -11,9 +17,81 @@ from daowod.acquisition import (
     score_proposals,
     select_images,
 )
-from daowod.dataset import DatasetState
+from daowod.config import AcquisitionConfig
+from daowod.dataset import DatasetState, build_long_tail_pool, file_sha256
+from daowod.experiment import run_active_round
 from daowod.metrics import Detection, GroundTruth, grouped_unknown_recall
 from daowod.prob_adapter import ProposalBatch
+
+
+def _write_voc_xml(path: Path, class_names: list[str]) -> None:
+    objects = "".join(f"<object><name>{class_name}</name></object>" for class_name in class_names)
+    path.write_text(f"<annotation>{objects}</annotation>\n", encoding="utf-8")
+
+
+def _write_npz(path: Path, **arrays: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, values in arrays.items():
+            buffer = io.BytesIO()
+            np.save(buffer, values)
+            info = zipfile.ZipInfo(f"{name}.npy", date_time=(2024, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_STORED
+            archive.writestr(info, buffer.getvalue())
+
+
+class FakeAdapter:
+    def __init__(self, *, fail_stage: str | None = None) -> None:
+        self.fail_stage = fail_stage
+        self.predict_calls: list[tuple[list[str], str]] = []
+        self.train_calls: list[list[str]] = []
+        self.evaluate_calls: list[str] = []
+
+    def predict(
+        self,
+        image_ids: Sequence[str],
+        *,
+        checkpoint: str | Path,
+        output_path: str | Path,
+    ) -> ProposalBatch:
+        output = Path(output_path)
+        self.predict_calls.append((list(image_ids), str(checkpoint)))
+        count = len(image_ids)
+        _write_npz(
+            output,
+            image_ids=np.array(image_ids, dtype=object),
+            confidence=np.full(count, 0.5),
+            embeddings=np.tile(np.array([[1.0, 0.0]]), (count, 1)),
+            posterior=np.tile(np.array([[0.4, 0.6]]), (count, 1)),
+            predicted_labels=np.zeros(count, dtype=np.int64),
+            boxes=np.tile(np.array([[0.0, 1.0, 2.0, 3.0]]), (count, 1)),
+            objectness=np.full(count, 0.7),
+        )
+        return ProposalBatch.load(output)
+
+    def train(
+        self,
+        labelled_image_ids: Sequence[str],
+        *,
+        previous_checkpoint: str | Path | None,
+        run_dir: str | Path,
+        round_index: int,
+        seed: int,
+    ) -> Path:
+        if self.fail_stage == "train":
+            raise RuntimeError("fake train failure")
+        checkpoint = Path(run_dir) / "checkpoint.pth"
+        self.train_calls.append(list(labelled_image_ids))
+        checkpoint.write_bytes(b"fake checkpoint\n")
+        return checkpoint
+
+    def evaluate(self, *, checkpoint: str | Path, output_path: str | Path) -> dict[str, object]:
+        if self.fail_stage == "evaluate":
+            raise RuntimeError("fake evaluate failure")
+        metrics = {"known_mAP": 0.1, "U_Recall": 0.2, "WI": 0.3, "A_OSE": 4}
+        self.evaluate_calls.append(str(checkpoint))
+        Path(output_path).write_text(json.dumps(metrics, sort_keys=True) + "\n", encoding="utf-8")
+        return metrics
 
 
 def test_coherence_gates_only_rarity() -> None:
@@ -85,16 +163,271 @@ def test_dataset_state_reveal() -> None:
 
 def test_proposal_batch_npz_schema(tmp_path: Path) -> None:
     path = tmp_path / "proposals.npz"
-    np.savez(
+    _write_npz(
         path,
         image_ids=np.array(["a", "b"], dtype=object),
         confidence=np.array([0.4, 0.6]),
         embeddings=np.array([[1.0, 0.0], [0.0, 1.0]]),
+        posterior=np.array([[0.2, 0.8], [0.7, 0.3]]),
+        predicted_labels=np.array([1, 0]),
+        boxes=np.array([[0.0, 0.0, 1.0, 1.0], [1.0, 1.0, 2.0, 2.0]]),
+        objectness=np.array([0.9, 0.8]),
     )
     batch = ProposalBatch.load(path)
     assert batch.embeddings.shape == (2, 2)
+    assert batch.posterior is not None and batch.posterior.shape == (2, 2)
+    assert batch.predicted_labels is not None and batch.predicted_labels.tolist() == [1, 0]
+    assert batch.boxes is not None and batch.boxes.shape == (2, 4)
+    assert batch.objectness is not None and batch.objectness.tolist() == [0.9, 0.8]
 
     missing = tmp_path / "missing.npz"
     np.savez(missing, image_ids=np.array(["a"], dtype=object), confidence=np.array([0.4]))
     with pytest.raises(ValueError, match="Missing proposal NPZ fields"):
         ProposalBatch.load(missing)
+
+
+def test_run_active_round_full_is_deterministic_and_reveals_complete_images(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_xml_parse(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("active acquisition must not parse candidate XML")
+
+    monkeypatch.setattr("xml.etree.ElementTree.parse", fail_xml_parse)
+    acquisition = AcquisitionConfig(cluster_count=1, neighbour_count=1, top_k=1)
+    adapter = FakeAdapter()
+    round_args = {
+        "checkpoint": "current.pth",
+        "candidate_ids": ["candidate"],
+        "reference_ids": ["reference"],
+        "labelled_ids": ["already_labelled"],
+        "strategy": "full",
+        "budget": 1,
+        "acquisition_config": acquisition,
+        "seed": 7,
+    }
+
+    first = run_active_round(
+        adapter=adapter,
+        output_dir=tmp_path / "first",
+        **round_args,
+    )
+    second = run_active_round(
+        adapter=FakeAdapter(),
+        output_dir=tmp_path / "second",
+        **round_args,
+    )
+
+    assert first["selected_image_ids"] == ["candidate"]
+    assert second["selected_image_ids"] == first["selected_image_ids"]
+    assert first["remaining_candidate_ids"] == []
+    assert first["labelled_ids"] == ["already_labelled", "candidate"]
+    assert adapter.predict_calls == [(["candidate"], "current.pth"), (["reference"], "current.pth")]
+    assert adapter.train_calls == [["already_labelled", "candidate"]]
+    assert adapter.evaluate_calls == [str(tmp_path / "first" / "checkpoint.pth")]
+
+    for filename in (
+        "proposal_scores.csv",
+        "image_scores.csv",
+        "selected_ids.txt",
+        "labelled_ids.txt",
+        "remaining_pool_ids.txt",
+        "round_manifest.json",
+    ):
+        assert (tmp_path / "first" / filename).read_bytes() == (
+            tmp_path / "second" / filename
+        ).read_bytes()
+
+    with (tmp_path / "first" / "proposal_scores.csv").open(newline="", encoding="utf-8") as file:
+        score_row = next(csv.DictReader(file))
+    expected_score = (
+        acquisition.weights.uncertainty * float(score_row["uncertainty"])
+        + acquisition.weights.novelty * float(score_row["novelty"])
+        + acquisition.weights.rarity * float(score_row["rarity_bonus"])
+    )
+    assert float(score_row["coherence"]) == pytest.approx(0.0)
+    assert float(score_row["rarity_bonus"]) == pytest.approx(0.0)
+    assert float(score_row["score"]) == pytest.approx(expected_score)
+    assert float(score_row["score"]) > 0
+
+    manifest = json.loads((tmp_path / "first" / "round_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["completed"] is True
+    assert manifest["metrics"] == {"known_mAP": 0.1, "U_Recall": 0.2, "WI": 0.3, "A_OSE": 4}
+    assert manifest["candidate_proposals_sha256"] == file_sha256(
+        tmp_path / "first" / "candidate_proposals.npz"
+    )
+    assert manifest["reference_proposals_sha256"] == file_sha256(
+        tmp_path / "first" / "reference_proposals.npz"
+    )
+
+
+def test_run_active_round_random_is_seeded_locally(tmp_path: Path) -> None:
+    round_args = {
+        "checkpoint": "current.pth",
+        "candidate_ids": ["a", "b", "c", "d"],
+        "reference_ids": [],
+        "labelled_ids": [],
+        "strategy": "random",
+        "budget": 2,
+        "acquisition_config": AcquisitionConfig(),
+        "seed": 5,
+        "round_index": 1,
+    }
+    random.seed(12345)
+    before = random.getstate()
+    first = run_active_round(
+        adapter=FakeAdapter(),
+        output_dir=tmp_path / "first_random",
+        **round_args,
+    )
+    after = random.getstate()
+    second = run_active_round(
+        adapter=FakeAdapter(),
+        output_dir=tmp_path / "second_random",
+        **round_args,
+    )
+
+    assert before == after
+    assert first["selected_image_ids"] == second["selected_image_ids"]
+    assert set(first["remaining_candidate_ids"]).isdisjoint(first["selected_image_ids"])
+    assert first["labelled_ids"] == first["selected_image_ids"]
+    assert not (tmp_path / "first_random" / "proposal_scores.csv").exists()
+    assert not (tmp_path / "first_random" / "image_scores.csv").exists()
+    assert not (tmp_path / "first_random" / "reference_proposals.npz").exists()
+
+
+def test_run_active_round_rejects_invalid_inputs_and_completed_output(tmp_path: Path) -> None:
+    kwargs = {
+        "adapter": FakeAdapter(),
+        "checkpoint": "current.pth",
+        "candidate_ids": ["a"],
+        "reference_ids": ["r"],
+        "labelled_ids": [],
+        "output_dir": tmp_path / "round",
+        "strategy": "full",
+        "budget": 1,
+        "acquisition_config": AcquisitionConfig(cluster_count=1),
+        "seed": 0,
+    }
+    with pytest.raises(ValueError, match="strategy"):
+        run_active_round(**{**kwargs, "strategy": "uncertainty"})
+    with pytest.raises(ValueError, match="budget"):
+        run_active_round(**{**kwargs, "budget": 0})
+    with pytest.raises(ValueError, match="budget"):
+        run_active_round(**{**kwargs, "budget": 2})
+
+    run_active_round(**kwargs)
+    with pytest.raises(ValueError, match="Completed round"):
+        run_active_round(**kwargs)
+
+
+def test_run_active_round_failures_keep_exports_and_incomplete_manifest(tmp_path: Path) -> None:
+    kwargs = {
+        "checkpoint": "current.pth",
+        "candidate_ids": ["candidate"],
+        "reference_ids": ["reference"],
+        "labelled_ids": [],
+        "strategy": "full",
+        "budget": 1,
+        "acquisition_config": AcquisitionConfig(cluster_count=1),
+        "seed": 0,
+    }
+
+    train_dir = tmp_path / "train_failure"
+    with pytest.raises(RuntimeError, match="training failed"):
+        run_active_round(adapter=FakeAdapter(fail_stage="train"), output_dir=train_dir, **kwargs)
+    assert (train_dir / "candidate_proposals.npz").exists()
+    assert (train_dir / "reference_proposals.npz").exists()
+    assert (
+        json.loads((train_dir / "round_manifest.json").read_text(encoding="utf-8"))["completed"]
+        is False
+    )
+
+    eval_dir = tmp_path / "evaluate_failure"
+    with pytest.raises(RuntimeError, match="evaluation failed"):
+        run_active_round(adapter=FakeAdapter(fail_stage="evaluate"), output_dir=eval_dir, **kwargs)
+    assert (eval_dir / "candidate_proposals.npz").exists()
+    assert (eval_dir / "reference_proposals.npz").exists()
+    assert (eval_dir / "checkpoint.pth").exists()
+    assert (
+        json.loads((eval_dir / "round_manifest.json").read_text(encoding="utf-8"))["completed"]
+        is False
+    )
+
+
+def test_long_tail_pool_protocol_is_deterministic_and_records_distribution(
+    tmp_path: Path,
+) -> None:
+    annotations = tmp_path / "Annotations"
+    annotations.mkdir()
+    split = tmp_path / "train.txt"
+    image_classes = {
+        "img1": ["common"],
+        "img2": ["common"],
+        "img3": ["common"],
+        "img4": ["common"],
+        "img5": ["common", "middle"],
+        "img6": ["common", "middle"],
+        "img7": ["middle"],
+        "img8": ["rare"],
+        "img9": ["background"],
+    }
+    split.write_text("\n".join(image_classes) + "\n", encoding="utf-8")
+    for image_id, class_names in image_classes.items():
+        _write_voc_xml(annotations / f"{image_id}.xml", class_names)
+    original_xml = {path.name: path.read_bytes() for path in annotations.glob("*.xml")}
+
+    first = build_long_tail_pool(
+        annotations,
+        split,
+        ["common", "middle", "rare"],
+        tmp_path / "first",
+        imbalance_ratio=9.0,
+        seed=3,
+    )
+    second = build_long_tail_pool(
+        annotations,
+        split,
+        ["common", "middle", "rare"],
+        tmp_path / "second",
+        imbalance_ratio=9.0,
+        seed=3,
+    )
+
+    for key in ("pool_split_path", "class_stats_path", "manifest_path"):
+        assert Path(first[key]).read_bytes() == Path(second[key]).read_bytes()
+    assert all(path.read_bytes() == original_xml[path.name] for path in annotations.glob("*.xml"))
+
+    source_ids = set(image_classes)
+    selected_ids = Path(first["pool_split_path"]).read_text(encoding="utf-8").splitlines()
+    assert selected_ids == first["selected_image_ids"]
+    assert set(selected_ids) <= source_ids
+
+    with Path(first["class_stats_path"]).open(newline="", encoding="utf-8") as file:
+        rows = list(csv.DictReader(file))
+    target_frequencies = [int(row["target_frequency"]) for row in rows]
+    assert target_frequencies == sorted(target_frequencies, reverse=True)
+    assert all(int(row["target_frequency"]) >= 1 for row in rows)
+    assert {row["group"] for row in rows} == {"head", "medium", "tail"}
+
+    realised = {row["group"]: int(row["realised_frequency"]) for row in rows}
+    assert realised["head"] >= realised["medium"] >= realised["tail"]
+
+    manifest = json.loads(Path(first["manifest_path"]).read_text(encoding="utf-8"))
+    assert manifest["source_split_sha256"] == file_sha256(split)
+    assert manifest["pool_ids_sha256"] == file_sha256(Path(first["pool_split_path"]))
+    assert manifest["excluded_image_count"] == 1
+
+
+def test_long_tail_pool_rejects_invalid_or_missing_inputs(tmp_path: Path) -> None:
+    annotations = tmp_path / "Annotations"
+    annotations.mkdir()
+    split = tmp_path / "train.txt"
+    split.write_text("missing_image\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="imbalance_ratio"):
+        build_long_tail_pool(annotations, split, ["common"], tmp_path / "out", imbalance_ratio=0.5)
+    with pytest.raises(FileNotFoundError, match="Missing image set"):
+        build_long_tail_pool(annotations, tmp_path / "missing.txt", ["common"], tmp_path / "out")
+    with pytest.raises(FileNotFoundError, match="Missing annotation"):
+        build_long_tail_pool(annotations, split, ["common"], tmp_path / "out")
