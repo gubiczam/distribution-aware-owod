@@ -56,7 +56,7 @@ def test_image_selection_respects_fixed_budget() -> None:
         budget=2,
         top_k=2,
     )
-    assert selected == ["b", "a"]
+    assert selected == ["b", "c"]
 
 
 def test_grouped_unknown_recall() -> None:

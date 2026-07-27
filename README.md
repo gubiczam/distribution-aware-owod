@@ -52,7 +52,7 @@ PROB proposals
 
 ```text
 configs/experiment.yaml      Editable experiment configuration
-notebooks/contribution_a.ipynb Thin notebook entry point
+notebooks/contribution_a.ipynb Main executable Colab research notebook
 src/daowod/acquisition.py    Contribution-A scoring logic
 src/daowod/config.py         YAML configuration loading
 src/daowod/dataset.py        VOC image IDs, annotations, pools
@@ -77,7 +77,7 @@ Still external to this repository:
 
 - real PROB training;
 - real PROB evaluation;
-- proposal export from an installed PROB checkout and checkpoint.
+- full multi-round proposal export from an installed PROB checkout and checkpoint.
 
 The official PROB evaluator remains the source for known mAP, standard U-Recall,
 Wilderness Impact, and A-OSE. This repository only adds grouped diagnostic recall.
@@ -98,6 +98,33 @@ ruff format --check .
 pytest
 python -m compileall -q src
 ```
+
+## Colab Notebook
+
+Open `notebooks/contribution_a.ipynb` in Google Colab as the main executable
+research notebook. It clones this repository and the official PROB repository,
+installs DAOWOD, runs the local checks, and executes detector-independent synthetic
+validation without requiring external data.
+
+Optional real PROB integration requires this Google Drive layout:
+
+```text
+MyDrive/DAOWOD/
+|-- data/
+|   `-- OWOD/
+|       |-- JPEGImages/
+|       |-- Annotations/
+|       `-- ImageSets/
+|           `-- TOWOD/
+`-- checkpoints/
+    `-- MOWODB/
+        `-- t1.pth
+```
+
+When those assets and a compatible PROB attention backend are available, the notebook
+can run a one-image proposal export smoke test and score the exported proposal
+features. Missing Drive data or checkpoints are reported as `MISSING` or `SKIPPED`,
+not as code failures.
 
 ## PROB Schemas
 
