@@ -13,6 +13,8 @@ import pytest
 
 from daowod.acquisition import (
     AcquisitionWeights,
+    _offline_strategy_scores,
+    compare_acquisition_strategies,
     compute_proposal_scores,
     score_proposals,
     select_images,
@@ -38,6 +40,41 @@ def _write_npz(path: Path, **arrays: np.ndarray) -> None:
             info = zipfile.ZipInfo(f"{name}.npy", date_time=(2024, 1, 1, 0, 0, 0))
             info.compress_type = zipfile.ZIP_STORED
             archive.writestr(info, buffer.getvalue())
+
+
+def _write_offline_proposals(
+    tmp_path: Path,
+    *,
+    image_ids: list[str],
+    confidence: list[float],
+    predicted_labels: list[int],
+) -> tuple[Path, Path]:
+    candidate_path = tmp_path / "candidate_proposals.npz"
+    reference_path = tmp_path / "reference_proposals.npz"
+    embeddings = np.array(
+        [[float(index + 1), float((index % 2) + 1)] for index in range(len(image_ids))]
+    )
+    _write_npz(
+        candidate_path,
+        image_ids=np.array(image_ids, dtype=object),
+        confidence=np.array(confidence, dtype=np.float64),
+        embeddings=embeddings,
+        posterior=np.tile(np.array([[0.4, 0.6]], dtype=np.float64), (len(image_ids), 1)),
+        predicted_labels=np.array(predicted_labels, dtype=np.int64),
+        boxes=np.tile(np.array([[0.0, 1.0, 2.0, 3.0]], dtype=np.float64), (len(image_ids), 1)),
+        objectness=np.full(len(image_ids), 0.7, dtype=np.float64),
+    )
+    _write_npz(
+        reference_path,
+        image_ids=np.array(["reference"], dtype=object),
+        confidence=np.array([0.5], dtype=np.float64),
+        embeddings=np.array([[1.0, 1.0]], dtype=np.float64),
+        posterior=np.array([[0.4, 0.6]], dtype=np.float64),
+        predicted_labels=np.array([0], dtype=np.int64),
+        boxes=np.array([[0.0, 1.0, 2.0, 3.0]], dtype=np.float64),
+        objectness=np.array([0.7], dtype=np.float64),
+    )
+    return candidate_path, reference_path
 
 
 class FakeAdapter:
@@ -106,6 +143,93 @@ def test_coherence_gates_only_rarity() -> None:
     base = 0.3 * 0.8 + 0.2 * 0.6
     assert scores[0] == pytest.approx(base)
     assert scores[1] == pytest.approx(base + 0.5)
+
+
+def test_offline_strategy_formulas_are_exact() -> None:
+    weights = AcquisitionWeights()
+    result = score_proposals(
+        strategy="full",
+        uncertainty_mode="ambiguity",
+        pseudo_label_source="predicted",
+        confidence=[0.1, 0.4],
+        posterior=None,
+        embeddings=[[1.0, 0.0], [0.0, 1.0]],
+        reference_embeddings=[[1.0, 0.0]],
+        predicted_labels=[0, 1],
+        cluster_count=2,
+        neighbour_count=1,
+        seed=0,
+        weights=weights,
+    )
+
+    assert _offline_strategy_scores("uncertainty", result, weights) == pytest.approx(
+        result.uncertainty
+    )
+    assert _offline_strategy_scores("uncertainty_novelty", result, weights) == pytest.approx(
+        0.3 * result.uncertainty + 0.2 * result.novelty
+    )
+    assert _offline_strategy_scores("rarity_no_coherence", result, weights) == pytest.approx(
+        0.3 * result.uncertainty + 0.2 * result.novelty + 0.5 * result.rarity
+    )
+    assert _offline_strategy_scores("full", result, weights) == pytest.approx(
+        0.3 * result.uncertainty + 0.2 * result.novelty + 0.5 * result.rarity * result.coherence
+    )
+    assert not np.allclose(
+        _offline_strategy_scores("rarity_no_coherence", result, weights),
+        _offline_strategy_scores("full", result, weights),
+    )
+
+
+def test_existing_public_scorer_behaviour_is_preserved() -> None:
+    weights = AcquisitionWeights()
+    uncertainty = np.array([0.8, 0.2])
+    novelty = np.array([0.6, 0.4])
+    rarity = np.array([1.0, 0.5])
+    coherence = np.array([0.0, 0.25])
+
+    old_uncertainty_novelty = compute_proposal_scores(
+        strategy="uncertainty_novelty",
+        uncertainty=uncertainty,
+        novelty=novelty,
+        rarity=rarity,
+        coherence=coherence,
+        weights=weights,
+    )
+    full = compute_proposal_scores(
+        strategy="full",
+        uncertainty=uncertainty,
+        novelty=novelty,
+        rarity=rarity,
+        coherence=coherence,
+        weights=weights,
+    )
+
+    assert old_uncertainty_novelty == pytest.approx((0.3 * uncertainty + 0.2 * novelty) / 0.5)
+    assert full == pytest.approx(0.3 * uncertainty + 0.2 * novelty + 0.5 * rarity * coherence)
+
+
+def test_zero_coherence_keeps_uncertainty_and_novelty_but_gates_rarity() -> None:
+    weights = AcquisitionWeights()
+    result = score_proposals(
+        strategy="full",
+        uncertainty_mode="ambiguity",
+        pseudo_label_source="predicted",
+        confidence=[0.4],
+        posterior=None,
+        embeddings=[[1.0, 0.0]],
+        reference_embeddings=[[0.0, 1.0]],
+        predicted_labels=[0],
+        cluster_count=1,
+        neighbour_count=1,
+        seed=0,
+        weights=weights,
+    )
+    full = _offline_strategy_scores("full", result, weights)
+    ungated = _offline_strategy_scores("rarity_no_coherence", result, weights)
+    assert result.coherence[0] == pytest.approx(0.0)
+    assert full[0] == pytest.approx(0.3 * result.uncertainty[0] + 0.2 * result.novelty[0])
+    assert ungated[0] == pytest.approx(full[0] + 0.5)
+    assert ungated[0] != pytest.approx(full[0])
 
 
 def test_complete_proposal_scoring() -> None:
@@ -184,6 +308,134 @@ def test_proposal_batch_npz_schema(tmp_path: Path) -> None:
     np.savez(missing, image_ids=np.array(["a"], dtype=object), confidence=np.array([0.4]))
     with pytest.raises(ValueError, match="Missing proposal NPZ fields"):
         ProposalBatch.load(missing)
+
+
+def test_compare_acquisition_strategies_is_deterministic_and_diagnostic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_xml_parse(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("offline acquisition must not parse XML annotations")
+
+    monkeypatch.setattr("xml.etree.ElementTree.parse", fail_xml_parse)
+    candidate_path, reference_path = _write_offline_proposals(
+        tmp_path,
+        image_ids=["a", "a", "b", "b"],
+        confidence=[0.5, 0.6, 1.0, 1.0],
+        predicted_labels=[0, 1, 1, 1],
+    )
+    config = AcquisitionConfig(pseudo_label_source="predicted", top_k=2, neighbour_count=1)
+    strategies = [
+        "random",
+        "uncertainty",
+        "uncertainty_novelty",
+        "rarity_no_coherence",
+        "full",
+    ]
+
+    random.seed(12345)
+    random_state = random.getstate()
+    first = compare_acquisition_strategies(
+        candidate_path,
+        reference_path,
+        strategies=strategies,
+        budget=1,
+        seed=7,
+        acquisition_config=config,
+        output_dir=tmp_path / "first",
+    )
+    assert random.getstate() == random_state
+    second = compare_acquisition_strategies(
+        candidate_path,
+        reference_path,
+        strategies=strategies,
+        budget=1,
+        seed=7,
+        acquisition_config=config,
+        output_dir=tmp_path / "second",
+    )
+
+    assert [row["strategy"] for row in first["summary"]] == strategies
+    assert first == second
+    assert first["selected_ids"]["uncertainty"] == ["a"]
+    assert {path.name for path in (tmp_path / "first").iterdir()} == {
+        "strategy_summary.csv",
+        "selected_ids.json",
+        "overlap_matrix.csv",
+    }
+    for filename in ("strategy_summary.csv", "selected_ids.json", "overlap_matrix.csv"):
+        assert (tmp_path / "first" / filename).read_bytes() == (
+            tmp_path / "second" / filename
+        ).read_bytes()
+
+    rows = {row["strategy"]: row for row in first["summary"]}
+    uncertainty_row = rows["uncertainty"]
+    assert uncertainty_row["unique_pseudo_classes"] == 2
+    assert uncertainty_row["pseudo_class_entropy"] == pytest.approx(np.log(2.0))
+    assert uncertainty_row["mean_uncertainty"] == pytest.approx(0.9)
+    assert rows["full"]["mean_rarity_bonus"] <= rows["full"]["mean_rarity"]
+    for left in strategies:
+        assert first["overlap_matrix"][left][left] == len(first["selected_ids"][left])
+        for right in strategies:
+            assert first["overlap_matrix"][left][right] == first["overlap_matrix"][right][left]
+
+    expected_scores = _offline_strategy_scores(
+        "uncertainty",
+        score_proposals(
+            strategy="full",
+            uncertainty_mode="ambiguity",
+            pseudo_label_source="predicted",
+            confidence=[0.5, 0.6, 1.0, 1.0],
+            posterior=None,
+            embeddings=[[1.0, 1.0], [2.0, 2.0], [3.0, 1.0], [4.0, 2.0]],
+            reference_embeddings=[[1.0, 1.0]],
+            predicted_labels=[0, 1, 1, 1],
+            cluster_count=config.cluster_count,
+            neighbour_count=1,
+            seed=7,
+            weights=config.weights,
+        ),
+        config.weights,
+    )
+    assert select_images(["a", "a", "b", "b"], expected_scores, budget=1, top_k=2) == ["a"]
+
+
+def test_compare_acquisition_rejects_invalid_strategy_and_budget(tmp_path: Path) -> None:
+    candidate_path, reference_path = _write_offline_proposals(
+        tmp_path,
+        image_ids=["a"],
+        confidence=[0.5],
+        predicted_labels=[0],
+    )
+    config = AcquisitionConfig(pseudo_label_source="predicted")
+
+    with pytest.raises(ValueError, match="Unknown acquisition strategies"):
+        compare_acquisition_strategies(
+            candidate_path,
+            reference_path,
+            strategies=["rarity"],
+            budget=1,
+            seed=0,
+            acquisition_config=config,
+        )
+    with pytest.raises(ValueError, match="budget"):
+        compare_acquisition_strategies(
+            candidate_path,
+            reference_path,
+            strategies=["full"],
+            budget=0,
+            seed=0,
+            acquisition_config=config,
+        )
+    with pytest.raises(ValueError, match="budget"):
+        compare_acquisition_strategies(
+            candidate_path,
+            reference_path,
+            strategies=["full"],
+            budget=2,
+            seed=0,
+            acquisition_config=config,
+        )
 
 
 def test_run_active_round_full_is_deterministic_and_reveals_complete_images(
