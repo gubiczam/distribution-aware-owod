@@ -77,9 +77,42 @@ def _write_offline_proposals(
     return candidate_path, reference_path
 
 
+def _round_candidate_batch() -> ProposalBatch:
+    return ProposalBatch(
+        image_ids=np.array(["img_a", "img_a", "img_b", "img_c"], dtype=object),
+        confidence=np.array([0.5, 0.4, 0.9, 0.55], dtype=np.float64),
+        embeddings=np.array(
+            [[1.0, 0.0], [1.0, 0.0], [-1.0, 0.0], [0.0, 1.0]],
+            dtype=np.float64,
+        ),
+        posterior=np.tile(np.array([[0.4, 0.6]], dtype=np.float64), (4, 1)),
+        predicted_labels=np.array([0, 0, 1, 2], dtype=np.int64),
+        boxes=np.tile(np.array([[0.0, 1.0, 2.0, 3.0]], dtype=np.float64), (4, 1)),
+        objectness=np.full(4, 0.7, dtype=np.float64),
+    ).validate()
+
+
+def _round_reference_batch() -> ProposalBatch:
+    return ProposalBatch(
+        image_ids=np.array(["ref"], dtype=object),
+        confidence=np.array([0.5], dtype=np.float64),
+        embeddings=np.array([[1.0, 0.0]], dtype=np.float64),
+        posterior=np.array([[0.4, 0.6]], dtype=np.float64),
+        predicted_labels=np.array([0], dtype=np.int64),
+        boxes=np.array([[0.0, 1.0, 2.0, 3.0]], dtype=np.float64),
+        objectness=np.array([0.7], dtype=np.float64),
+    ).validate()
+
+
 class FakeAdapter:
-    def __init__(self, *, fail_stage: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        fail_stage: str | None = None,
+        proposal_batches: dict[tuple[str, ...], ProposalBatch] | None = None,
+    ) -> None:
         self.fail_stage = fail_stage
+        self.proposal_batches = proposal_batches or {}
         self.predict_calls: list[tuple[list[str], str]] = []
         self.train_calls: list[list[str]] = []
         self.evaluate_calls: list[str] = []
@@ -92,18 +125,34 @@ class FakeAdapter:
         output_path: str | Path,
     ) -> ProposalBatch:
         output = Path(output_path)
-        self.predict_calls.append((list(image_ids), str(checkpoint)))
-        count = len(image_ids)
-        _write_npz(
-            output,
-            image_ids=np.array(image_ids, dtype=object),
-            confidence=np.full(count, 0.5),
-            embeddings=np.tile(np.array([[1.0, 0.0]]), (count, 1)),
-            posterior=np.tile(np.array([[0.4, 0.6]]), (count, 1)),
-            predicted_labels=np.zeros(count, dtype=np.int64),
-            boxes=np.tile(np.array([[0.0, 1.0, 2.0, 3.0]]), (count, 1)),
-            objectness=np.full(count, 0.7),
-        )
+        ids = list(image_ids)
+        self.predict_calls.append((ids, str(checkpoint)))
+        batch = self.proposal_batches.get(tuple(ids))
+        if batch is None:
+            count = len(ids)
+            batch = ProposalBatch(
+                image_ids=np.array(ids, dtype=object),
+                confidence=np.full(count, 0.5),
+                embeddings=np.tile(np.array([[1.0, 0.0]]), (count, 1)),
+                posterior=np.tile(np.array([[0.4, 0.6]]), (count, 1)),
+                predicted_labels=np.zeros(count, dtype=np.int64),
+                boxes=np.tile(np.array([[0.0, 1.0, 2.0, 3.0]]), (count, 1)),
+                objectness=np.full(count, 0.7),
+            ).validate()
+        arrays: dict[str, np.ndarray] = {
+            "image_ids": batch.image_ids,
+            "confidence": batch.confidence,
+            "embeddings": batch.embeddings,
+        }
+        if batch.posterior is not None:
+            arrays["posterior"] = batch.posterior
+        if batch.predicted_labels is not None:
+            arrays["predicted_labels"] = batch.predicted_labels
+        if batch.boxes is not None:
+            arrays["boxes"] = batch.boxes
+        if batch.objectness is not None:
+            arrays["objectness"] = batch.objectness
+        _write_npz(output, **arrays)
         return ProposalBatch.load(output)
 
     def train(
@@ -511,6 +560,129 @@ def test_run_active_round_full_is_deterministic_and_reveals_complete_images(
     assert manifest["reference_proposals_sha256"] == file_sha256(
         tmp_path / "first" / "reference_proposals.npz"
     )
+
+
+def test_run_active_round_rarity_no_coherence_completes_and_scores_without_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_xml_parse(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("active acquisition must not parse candidate XML")
+
+    monkeypatch.setattr("xml.etree.ElementTree.parse", fail_xml_parse)
+    candidate_ids = ["img_a", "img_b", "img_c"]
+    reference_ids = ["ref"]
+    adapter = FakeAdapter(
+        proposal_batches={
+            tuple(candidate_ids): _round_candidate_batch(),
+            tuple(reference_ids): _round_reference_batch(),
+        }
+    )
+    result = run_active_round(
+        adapter=adapter,
+        checkpoint="current.pth",
+        candidate_ids=candidate_ids,
+        reference_ids=reference_ids,
+        labelled_ids=["labelled"],
+        output_dir=tmp_path / "rarity",
+        strategy="rarity_no_coherence",
+        budget=2,
+        acquisition_config=AcquisitionConfig(
+            pseudo_label_source="predicted",
+            neighbour_count=1,
+            top_k=2,
+        ),
+        seed=11,
+    )
+
+    assert result["selected_image_ids"] == ["img_c", "img_b"]
+    assert result["remaining_candidate_ids"] == ["img_a"]
+    assert result["labelled_ids"] == ["labelled", "img_c", "img_b"]
+    assert adapter.predict_calls == [(candidate_ids, "current.pth"), (reference_ids, "current.pth")]
+    assert adapter.train_calls == [["labelled", "img_c", "img_b"]]
+    assert adapter.evaluate_calls == [str(tmp_path / "rarity" / "checkpoint.pth")]
+
+    with (tmp_path / "rarity" / "proposal_scores.csv").open(newline="", encoding="utf-8") as file:
+        proposal_rows = list(csv.DictReader(file))
+    assert [float(row["score"]) for row in proposal_rows] == pytest.approx([0.3, 0.24, 0.76, 0.87])
+    for row in proposal_rows:
+        assert float(row["rarity_bonus"]) == pytest.approx(float(row["rarity"]))
+        assert float(row["score"]) == pytest.approx(
+            0.3 * float(row["uncertainty"])
+            + 0.2 * float(row["novelty"])
+            + 0.5 * float(row["rarity"])
+        )
+
+    with (tmp_path / "rarity" / "image_scores.csv").open(newline="", encoding="utf-8") as file:
+        image_rows = list(csv.DictReader(file))
+    assert [row["image_id"] for row in image_rows] == ["img_c", "img_b", "img_a"]
+    assert [float(row["score"]) for row in image_rows] == pytest.approx([0.87, 0.76, 0.27])
+    assert (
+        json.loads((tmp_path / "rarity" / "round_manifest.json").read_text(encoding="utf-8"))[
+            "strategy"
+        ]
+        == "rarity_no_coherence"
+    )
+    assert {path.name for path in (tmp_path / "rarity").iterdir()} >= {
+        "candidate_proposals.npz",
+        "reference_proposals.npz",
+        "proposal_scores.csv",
+        "image_scores.csv",
+        "selected_ids.txt",
+        "labelled_ids.txt",
+        "remaining_pool_ids.txt",
+        "checkpoint.pth",
+        "metrics.json",
+        "round_manifest.json",
+    }
+
+
+def test_run_active_round_full_regression_scores_image_scores_and_selection(
+    tmp_path: Path,
+) -> None:
+    candidate_ids = ["img_a", "img_b", "img_c"]
+    reference_ids = ["ref"]
+    run_active_round(
+        adapter=FakeAdapter(
+            proposal_batches={
+                tuple(candidate_ids): _round_candidate_batch(),
+                tuple(reference_ids): _round_reference_batch(),
+            }
+        ),
+        checkpoint="current.pth",
+        candidate_ids=candidate_ids,
+        reference_ids=reference_ids,
+        labelled_ids=[],
+        output_dir=tmp_path / "full",
+        strategy="full",
+        budget=2,
+        acquisition_config=AcquisitionConfig(
+            pseudo_label_source="predicted",
+            neighbour_count=1,
+            top_k=2,
+        ),
+        seed=11,
+    )
+
+    with (tmp_path / "full" / "proposal_scores.csv").open(newline="", encoding="utf-8") as file:
+        proposal_rows = list(csv.DictReader(file))
+    assert [float(row["score"]) for row in proposal_rows] == pytest.approx(
+        [0.3, 0.24, 0.42666666666666664, 0.5366666666666666]
+    )
+    assert [float(row["rarity_bonus"]) for row in proposal_rows] == pytest.approx(
+        [0.0, 0.0, 0.3333333333333333, 0.3333333333333333]
+    )
+
+    with (tmp_path / "full" / "image_scores.csv").open(newline="", encoding="utf-8") as file:
+        image_rows = list(csv.DictReader(file))
+    assert [row["image_id"] for row in image_rows] == ["img_c", "img_b", "img_a"]
+    assert [float(row["score"]) for row in image_rows] == pytest.approx(
+        [0.5366666666666666, 0.42666666666666664, 0.27]
+    )
+    assert (tmp_path / "full" / "selected_ids.txt").read_text(encoding="utf-8").splitlines() == [
+        "img_c",
+        "img_b",
+    ]
 
 
 def test_run_active_round_random_is_seeded_locally(tmp_path: Path) -> None:

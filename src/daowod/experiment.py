@@ -50,14 +50,14 @@ def _write_json(path: Path, data: dict[str, object]) -> None:
     temporary.replace(path)
 
 
-def _write_full_score_tables(
+def _write_score_tables(
     proposal_path: Path,
     image_path: Path,
     image_scores: dict[object, float],
     proposal_image_ids: Sequence[object],
     result: AcquisitionResult,
     *,
-    coherence_power: float,
+    rarity_bonus: np.ndarray,
 ) -> None:
     with proposal_path.open("w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(
@@ -75,7 +75,6 @@ def _write_full_score_tables(
         )
         writer.writeheader()
         for index, image_id in enumerate(proposal_image_ids):
-            rarity_bonus = result.rarity[index] * result.coherence[index] ** coherence_power
             writer.writerow(
                 {
                     "image_id": str(image_id),
@@ -83,7 +82,7 @@ def _write_full_score_tables(
                     "novelty": float(result.novelty[index]),
                     "rarity": float(result.rarity[index]),
                     "coherence": float(result.coherence[index]),
-                    "rarity_bonus": float(rarity_bonus),
+                    "rarity_bonus": float(rarity_bonus[index]),
                     "score": float(result.scores[index]),
                 }
             )
@@ -117,8 +116,8 @@ def run_active_round(
 ) -> dict[str, object]:
     """Run one detector-backed active-learning round."""
 
-    if strategy not in {"random", "full"}:
-        raise ValueError("strategy must be 'random' or 'full'.")
+    if strategy not in {"random", "rarity_no_coherence", "full"}:
+        raise ValueError("strategy must be 'random', 'rarity_no_coherence', or 'full'.")
     if budget < 1:
         raise ValueError("budget must be positive.")
 
@@ -127,8 +126,8 @@ def run_active_round(
     labelled = _unique_ids("labelled_ids", labelled_ids)
     if budget > len(candidates):
         raise ValueError("budget must not exceed candidate image count.")
-    if strategy == "full" and not references:
-        raise ValueError("reference_ids must be non-empty for full scoring.")
+    if strategy != "random" and not references:
+        raise ValueError("reference_ids must be non-empty for proposal scoring.")
     overlap = set(candidates) & set(references)
     if overlap:
         raise ValueError(f"candidate_ids and reference_ids must not overlap: {sorted(overlap)}")
@@ -207,8 +206,9 @@ def run_active_round(
             raise RuntimeError("reference proposal export failed") from exc
 
         try:
+            scoring_strategy = "ungated_full" if strategy == "rarity_no_coherence" else "full"
             acquisition = score_proposals(
-                strategy="full",
+                strategy=scoring_strategy,
                 uncertainty_mode=acquisition_config.uncertainty_mode,
                 pseudo_label_source=acquisition_config.pseudo_label_source,
                 confidence=candidate_batch.confidence,
@@ -226,16 +226,22 @@ def run_active_round(
                 acquisition.scores,
                 top_k=acquisition_config.top_k,
             )
+            rarity_bonus = (
+                acquisition.rarity
+                if strategy == "rarity_no_coherence"
+                else acquisition.rarity
+                * np.power(acquisition.coherence, acquisition_config.weights.coherence_power)
+            )
         except Exception as exc:
             raise RuntimeError("proposal scoring failed") from exc
 
-        _write_full_score_tables(
+        _write_score_tables(
             proposal_scores_path,
             image_scores_path,
             image_scores,
             candidate_batch.image_ids,
             acquisition,
-            coherence_power=acquisition_config.weights.coherence_power,
+            rarity_bonus=rarity_bonus,
         )
         selected = [
             str(image_id)
