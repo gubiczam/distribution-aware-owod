@@ -19,7 +19,7 @@ from daowod.acquisition import (
     score_proposals,
     select_images,
 )
-from daowod.config import AcquisitionConfig
+from daowod.config import AcquisitionConfig, load_config
 from daowod.dataset import DatasetState, build_long_tail_pool, file_sha256
 from daowod.experiment import run_active_round
 from daowod.metrics import Detection, GroundTruth, grouped_unknown_recall
@@ -332,6 +332,63 @@ def test_dataset_state_reveal() -> None:
     state.reveal(selected)
     assert selected[0] in state.labelled_ids
     assert selected[0] not in state.pool_ids
+
+
+def test_load_config_accepts_multi_round_and_variant_strategy(tmp_path: Path) -> None:
+    config_path = tmp_path / "experiment.yaml"
+    config_path.write_text(
+        """
+name: multi-round
+active_learning:
+  rounds: 2
+  strategy: rarity_no_coherence
+  budget: 3
+  initial_images: 2
+  budget_per_round: 2
+  seeds:
+    - 0
+    - 1
+acquisition:
+  strategies:
+    - rarity_no_coherence
+    - full
+  uncertainty_mode: entropy
+  pseudo_label_source: predicted
+  cluster_count: 4
+  neighbour_count: 3
+  top_k: 2
+  weights:
+    uncertainty: 0.4
+    novelty: 0.3
+    rarity: 0.3
+    coherence_power: 0.7
+    rarity_power: 2.0
+dataset:
+  image_set_path: /tmp/train.txt
+  annotations_dir: /tmp/Annotations
+  unknown_classes:
+    - rare
+  long_tail:
+    enabled: true
+    imbalance_ratio: 10.0
+prob:
+  repository_path: /tmp/prob
+  initial_checkpoint: /tmp/checkpoint.pth
+  train_command: python train.py
+  predict_command: python predict.py
+  evaluate_command: python evaluate.py
+output_dir: outputs/test
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.active_learning.rounds == 2
+    assert config.active_learning.strategy == "rarity_no_coherence"
+    assert config.acquisition.strategies == ("rarity_no_coherence", "full")
+    assert config.acquisition.weights.coherence_power == pytest.approx(0.7)
 
 
 def test_proposal_batch_npz_schema(tmp_path: Path) -> None:

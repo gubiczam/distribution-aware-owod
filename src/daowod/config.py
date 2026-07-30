@@ -19,10 +19,20 @@ class ActiveLearningConfig:
     seeds: tuple[int, ...] = (0,)
 
     def __post_init__(self) -> None:
-        if self.rounds != 1:
-            raise ValueError("Only one active-learning round is supported.")
-        if self.strategy not in {"random", "full"}:
-            raise ValueError("strategy must be random or full.")
+        if self.rounds < 1:
+            raise ValueError("rounds must be positive.")
+        allowed = {
+            "random",
+            "uncertainty",
+            "uncertainty_novelty",
+            "rarity",
+            "rarity_no_coherence",
+            "rarity_coherence",
+            "ungated_full",
+            "full",
+        }
+        if self.strategy not in allowed:
+            raise ValueError("Unsupported acquisition strategy.")
         if min(self.budget, self.initial_images, self.budget_per_round) < 1:
             raise ValueError("Active-learning values must be positive.")
         if not self.seeds:
@@ -45,6 +55,7 @@ class AcquisitionConfig:
             "uncertainty",
             "uncertainty_novelty",
             "rarity",
+            "rarity_no_coherence",
             "rarity_coherence",
             "ungated_full",
             "full",
