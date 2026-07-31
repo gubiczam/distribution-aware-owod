@@ -138,6 +138,71 @@ k = 1, 2, 3, 5, 10) with a collapse at 10.
 selection. The default sits on a slope, not a plateau — and these weights were
 never tuned.
 
+## The outcome measurement that overturns part of the analysis above
+
+Everything up to here measured *selection agreement* — how much two strategies'
+image sets overlap, and how far a component's ranking correlates with another's.
+Those are the wrong statistics for the question Contribution A actually asks,
+which is about **which classes get annotated**. Measuring the objective directly
+changes the conclusion.
+
+**Tail lift** = fraction of selected images containing a tail-group class, divided
+by that fraction in the pool. 1.00 means no preference. Budget 10, 3 clustering
+seeds, 5 pool configurations, tail base rate 0.07:
+
+| strategy | reference | few_on_object | many_on_object | mild_imbalance | more_outliers | **mean** |
+|---|---|---|---|---|---|---|
+| `v2:rarity_coherence` (gated term alone) | 13.20 | 10.37 | 5.66 | 3.64 | 7.54 | **8.08** |
+| `v2:coherence` | 12.26 | 10.37 | 5.19 | 3.64 | 4.71 | 7.23 |
+| `v2:rarity` | 4.24 | 0.00 | 5.66 | 8.59 | 9.43 | 5.58 |
+| `v2:uncertainty` | 2.83 | 4.24 | 1.41 | 0.00 | 4.24 | 2.54 |
+| **`v2:full`** | 3.30 | 6.60 | 0.94 | 0.00 | 0.47 | **2.26** |
+| `v2:random` | 0.94 | 0.94 | 0.94 | 0.99 | 0.94 | 0.95 |
+| **`v2:full_no_coherence`** | 1.41 | 0.47 | 0.00 | 0.33 | 0.94 | **0.63** |
+| `v2:novelty` | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | **0.00** |
+
+Four results, each stable across all five configurations:
+
+1. **The gated rarity × coherence term is a strong mechanism: 8.08× tail lift**,
+   above 3.6× in every configuration. It is the best tail-selector of any variant
+   tested.
+2. **The composite `full` score retains only 28 % of it** (2.26 vs 8.08). The
+   `α·uncertainty + β·novelty` terms pull against the gate — consistent with the
+   signed correlations, which are **negative in 7/7 configurations**
+   (uncertainty↔gated −0.32, uncertainty↔novelty −0.32). `full` is a tug-of-war,
+   not a sum.
+3. **Without the gate the composite has no tail preference at all: 0.63, below the
+   pool base rate.** Inside `full`, the gate is worth a **3.58× tail lift** and is
+   the only reason `full` prefers the tail whatsoever.
+4. **Novelty scores 0.00 tail lift in every single configuration** — it never
+   selects a tail image, and it covers only 2.0 distinct classes against `full`'s
+   7.0. It is carrying weight β = 0.2 while working directly against the stated
+   objective.
+
+### An interpretive correction to Phase 1
+
+I reported rarity↔gated redundancy of 0.982 and read it as evidence that the gate
+does little. **That reading was wrong.** A rank correlation of 0.982 coexists with
+an outcome difference of 8.08 versus 0.63 in tail lift. The gate does not reorder
+the rarity ranking much — it reorders it *exactly where it matters*, at the top,
+which is the only region a budget-10 selection ever sees. Rank correlation over
+3,960 proposals is simply not the right statistic for a decision that depends on
+the top 30. The Phase 2 finding stands as measured (29 % selection difference,
+S/N 0.93), but it too must be read as "29 % of the selection, and that 29 % is
+where all of the long-tail behaviour lives".
+
+**Caveats that keep this from being a clean win.** `v2:coherence` and
+`v2:rarity_coherence` achieve high tail lift partly by chasing the tail
+exclusively: 4.2 distinct classes covered versus `full`'s 7.0, and 0.00 head
+coverage. For OWOD, known-class performance must also be maintained, so maximum
+tail lift is not automatically the best strategy — that trade-off can only be
+settled by retraining. And the novelty result is the most simulator-dependent
+number in this report: the simulated reference set is drawn around the background
+centre, whereas the real reference set is the top-20 unknown-scoring queries of
+Task-1 images. The audit flagged novelty's reference semantics as muddy (S8) on
+independent grounds, so the two lines of evidence agree, but this number in
+particular needs the real-data check.
+
 ## The two decisive falsification tests
 
 ### Test 1 — Is the gate distinguishable from an arbitrary perturbation?
@@ -214,23 +279,33 @@ The recommended schedule follows from the measured S/N, not from a budget guess:
 
 ### Does the current Contribution A appear scientifically defensible?
 
-**Partly, and not as currently configured.** Split the claim in two.
+**The mechanism is defensible. The composite score, as currently weighted, is
+not.** Three claims, separated:
 
-*"Uncertainty and distribution-awareness together select differently from either
-alone"* — **defensible.** The components are near-independent (ρ = 0.32, MI 0.05),
-each removal changes 76–80 % of the selection at S/N ≈ 2.4–2.5, and the effect
-holds across all 7 pool configurations.
+*"Uncertainty and distribution-awareness carry independent information"* —
+**defensible.** ρ = 0.32 with rarity, 0.03 with coherence; MI 0.05 and 0.008;
+removals change 76–80 % of the selection at S/N ≈ 2.4–2.5, stable across all 7
+configurations.
 
 *"Gating rarity by local coherence improves selection for long-tail categories"* —
-**not yet demonstrable, though the direction is right.** The gated term is 98.2 %
-rank-correlated with ungated rarity; its selection effect (0.294) is below the
-acquisition's own clustering noise (0.317); it is only marginally separable from a
-structure-destroying shuffle (z = 1.82); it varies 3× across assumptions and 7×
-across cluster counts; and it weakens as the budget grows. Against that, it moves
-tail coverage by +0.100 and never the wrong way.
+**supported, and more strongly than the selection statistics suggested.** The
+gated term alone achieves **8.08× tail lift**, above 3.6× in all 5 configurations
+tested, and is the best tail-selector of any variant. Inside `full`, the gate is
+worth **3.58×** and is the sole reason `full` prefers the tail at all. Its
+direction is consistent on 5/5 seeds in the coverage test, and it beats a
+structure-destroying shuffle at z = +1.82.
 
-The honest position: **the mechanism appears real but is currently buried in noise
-that the acquisition itself generates.**
+*"The current `full` score is a good way to combine these"* — **not defensible.**
+`full` retains only 28 % of its own gated term's tail lift, because its components
+anti-correlate (negative in 7/7 configurations) and the weights were never tuned.
+`v2:novelty` carries β = 0.2 while achieving **0.00 tail lift in every
+configuration**. And the gate's contribution is throttled to a 29 % selection
+effect that sits below the acquisition's own clustering noise (0.317), with a 7×
+range across an untuned cluster count.
+
+The honest position: **the idea works; the implementation dilutes it by roughly
+3.5× and then buries what remains in pseudo-labelling noise.** That is a
+composition and protocol problem, not a failure of the hypothesis.
 
 ### Which assumptions are supported?
 
@@ -307,31 +382,46 @@ That is not an argument against doing it; it is an argument about *how*.
 
 ### Recommendation
 
-1. **Do not change the algorithm yet.** The single largest uncertainty is that
-   every number here is synthetic. Run Stage 1 (offline, real proposals, 5 seeds,
-   12 ablations) first — two `predict` calls, no training. If real proposals show
-   rarity↔gated redundancy near 0.98 and clustering noise above the gate signal,
-   the case for filtering is made on real data. If the real pool differs, this
-   report's premises change.
-2. **Then add filtering as a new semantics version, not an edit.** Keep `v1:*`
-   and `v2:*` byte-identical, introduce the filtered estimator as `v3:*`, and
-   report v2 and v3 side by side. The registry's versioning already supports this,
-   which is precisely what it was built for. The pilot comparison survives; the
-   improvement is measured against it rather than replacing it.
-3. **Reframe the thesis contribution around what is well-powered.** The
-   defensible claim is the *framework and the diagnostic result*: a
-   distribution-aware score whose components are demonstrably independent, plus a
-   quantitative demonstration that the coherence gate's effect is smaller than the
-   noise its own pseudo-labelling introduces — with the fix identified and
-   measured. That is a stronger and more honest TDK contribution than an
-   underpowered claim that gating helps.
-4. **If only one thing is done:** drop `full_p05` from every future protocol. A
-   0.061 selection effect cannot support a comparison, and it consumed a quarter of
-   the pilot's GPU budget.
+**Do not change the algorithm yet — but for a different reason than I expected.**
+The evidence now says the mechanism is strong and the *weights* are wrong. That
+matters because a weight change is a configuration edit, not a redesign, and it is
+cheap to test. The order should be:
+
+1. **Run Stage 1 on real proposals first.** Two `predict` calls, no training,
+   `daowod-run diagnose --seeds 0 1 2 3 4`. Three numbers decide everything that
+   follows: the gated term's tail lift, `v2:novelty`'s tail lift, and the
+   clustering noise. Every quantitative claim in this report is synthetic, and the
+   novelty result in particular depends on how the reference set is built — which
+   the simulator gets wrong by construction.
+2. **Then run a weight sweep, not an algorithm change.** The λ×γ surface and the
+   tail-lift table together say the interesting region is γ ≫ α, β — plausibly
+   β = 0 given novelty's 0.00 tail lift. That is `daowod-run diagnose` with
+   different weight vectors, expressible entirely as new `StrategySpec` presets,
+   and it costs no GPU time. Adding `v2:full_no_novelty` and
+   `v2:rarity_coherence` to the retraining set is likely worth more than any new
+   component.
+3. **Only then consider unknown-filtered clustering, and add it as `v3:*`.** It
+   remains well-motivated (rarity rank stability 0.736 → 0.991) but it is now the
+   *second* problem, not the first: dilution costs 3.5× of the tail lift, noise
+   costs less. Keep `v1:*` and `v2:*` byte-identical and report v3 alongside, so
+   the pilot comparison survives and the improvement is measured against it.
+4. **Reframe the thesis claim around the measured mechanism.** The defensible
+   story is now stronger than "the framework plus a negative result": *a
+   coherence-gated rarity term selects long-tail images at ~8× the base rate, and
+   a diagnostic framework that shows why the naive composite recovers only a
+   quarter of that.* Both halves are supported by measurement.
+5. **If only one thing is done:** drop `full_p05` from every future protocol. Its
+   selection effect is 0.061 — under a fifth of the clustering noise — so the
+   comparison is undefined, and it consumed a quarter of the pilot's GPU budget.
 
 ---
 
 ## Artifacts
+
+`analysis/probes/` holds the three targeted probes:
+`falsification_tests.py` (shuffle test, tail-coverage test),
+`probe_unknown_filtering.py` (the v3 decision), `probe_tail_coverage.py`
+(tail lift per strategy).
 
 `analysis/validate_contribution_a.py` writes, per run:
 `phase1_distributions.csv`, `phase1_correlations.csv`,
