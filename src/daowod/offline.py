@@ -140,6 +140,7 @@ def diagnose_pool(
     separation_rows: list[dict[str, object]] = []
     effect_rows: list[dict[str, object]] = []
     selections_by_seed: dict[int, dict[str, list[str]]] = {}
+    scores_by_seed: dict[int, dict[str, Any]] = {}
     diagnostics_by_seed: dict[int, dict[str, Any]] = {}
     uncertainty_report: dict[str, Any] = {}
 
@@ -225,6 +226,7 @@ def diagnose_pool(
             )
 
         selections_by_seed[seed] = selections
+        scores_by_seed[seed] = scores
         for row in diag.strategy_separation(selections, scores=scores):
             separation_rows.append({"seed": seed, **row})
         effect_rows.extend(
@@ -240,6 +242,7 @@ def diagnose_pool(
                 confidence=candidates.confidence,
                 image_ids=candidates.image_ids,
                 budget=effective_budget,
+                objectness=candidates.objectness,
             )
 
     # Seed-to-seed stability of each strategy's own selection.
@@ -268,6 +271,30 @@ def diagnose_pool(
             }
         )
 
+    aggregation_rows: list[dict[str, Any]] = []
+    if any(scores_by_seed.values()):
+        contrast = (
+            "v2:full_no_coherence"
+            if all("v2:full_no_coherence" in v for v in scores_by_seed.values())
+            else next(
+                (
+                    name
+                    for name in names
+                    if name != "v2:full" and all(name in v for v in scores_by_seed.values())
+                ),
+                "",
+            )
+        )
+        if "v2:full" in next(iter(scores_by_seed.values())) and contrast:
+            aggregation_rows = diag.aggregation_stability(
+                scores_by_seed,
+                candidates.image_ids,
+                budget=effective_budget,
+                reference_strategy="v2:full",
+                contrast_strategy=contrast,
+            )
+
+    diag.write_rows(directory / "offline_aggregation_stability.csv", aggregation_rows)
     diag.write_rows(directory / "offline_proposals.csv", proposal_rows)
     diag.write_rows(directory / "offline_component_diagnostics.csv", component_rows)
     diag.write_rows(directory / "offline_strategy_separation.csv", separation_rows)
@@ -290,6 +317,7 @@ def diagnose_pool(
     )
 
     headline = _headline(
+        aggregation_rows=aggregation_rows,
         component_rows=component_rows,
         separation_rows=separation_rows,
         stability_rows=stability_rows,
@@ -317,6 +345,7 @@ def diagnose_pool(
 
 def _headline(
     *,
+    aggregation_rows: Sequence[Mapping[str, Any]],
     component_rows: Sequence[Mapping[str, Any]],
     separation_rows: Sequence[Mapping[str, Any]],
     stability_rows: Sequence[Mapping[str, Any]],
@@ -361,6 +390,16 @@ def _headline(
             "strategies": list(strategies),
         },
         "q1_uncertainty_differs_from_unknown_score": {
+            "per_method": {
+                name: {
+                    "spearman_with_unknown_score": values.get("spearman_with_unknown_score"),
+                    "spearman_with_objectness": values.get("spearman_with_objectness"),
+                    "prefers_low_objectness_proposals": values.get(
+                        "prefers_low_objectness_proposals"
+                    ),
+                }
+                for name, values in (uncertainty_report.get("methods") or {}).items()
+            },
             "entropy_spearman_with_unknown_score": entropy.get("spearman_with_unknown_score"),
             "entropy_is_monotone_in_unknown_score": entropy.get("is_monotone_in_unknown_score"),
             "entropy_selected_image_jaccard_with_unknown_score": entropy.get(
@@ -393,7 +432,10 @@ def _headline(
         "q5_strategies_select_different_images": {
             "mean_pairwise_jaccard": mean_of(separation_rows, "jaccard"),
             "full_vs_random_mean_jaccard": mean_of(full_vs_random, "jaccard"),
-            "least_separated_pair": min(
+            # The pair that is hardest to tell apart, i.e. highest Jaccard. Two
+            # strategies that select the same images cannot produce different
+            # downstream metrics, however different their proposal scores are.
+            "most_similar_pair": max(
                 (
                     {
                         "left": row["left"],
@@ -403,7 +445,25 @@ def _headline(
                     for row in separation_rows
                     if np.isfinite(float(row["jaccard"]))
                 ),
-                key=lambda row: -row["jaccard"],
+                key=lambda row: row["jaccard"],
+                default=None,
+            ),
+        },
+        "q5b_image_aggregation": {
+            "rows": [dict(row) for row in aggregation_rows],
+            "usable_methods": [
+                str(row["aggregation"]) for row in aggregation_rows if row.get("usable")
+            ],
+            "best_signal_to_noise": max(
+                (
+                    {
+                        "aggregation": str(row["aggregation"]),
+                        "signal_to_noise": float(row["signal_to_noise"]),
+                    }
+                    for row in aggregation_rows
+                    if np.isfinite(float(row.get("signal_to_noise", float("nan"))))
+                ),
+                key=lambda row: row["signal_to_noise"],
                 default=None,
             ),
         },

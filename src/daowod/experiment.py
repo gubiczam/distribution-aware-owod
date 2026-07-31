@@ -42,7 +42,7 @@ PROTOCOL_VERSION = 2
 
 
 def derive_seed(*parts: object) -> int:
-    """A distinct, reproducible seed for every (seed, round, strategy) triple.
+    """A reproducible 32-bit seed from any tuple of identifying parts.
 
     ``seed + round_index`` — the pre-audit derivation — collided across pairs:
     (seed 0, round 1) and (seed 1, round 0) produced the same clustering.
@@ -50,6 +50,22 @@ def derive_seed(*parts: object) -> int:
 
     payload = "|".join(str(part) for part in parts).encode("utf-8")
     return int.from_bytes(hashlib.sha256(payload).digest()[:4], "big")
+
+
+def derive_pool_seed(seed: int, round_index: int) -> int:
+    """The clustering seed, which must NOT depend on the strategy.
+
+    Pseudo-labelling partitions the *pool*; it is not part of a strategy's
+    definition. Including the strategy name here was measured to inject a
+    confound: on a 3,960-proposal pool, two strategies scoring identical
+    proposals received KMeans partitions agreeing on only 88 % of pairwise
+    co-memberships, and 0.280 of an apparent 0.462 selection difference between
+    ``v2:full`` and ``v2:full_no_coherence`` came from the differing partition
+    rather than from the coherence gate. Every strategy scoring the same pool now
+    shares one clustering, so a measured difference is attributable to the score.
+    """
+
+    return derive_seed("pool", seed, round_index)
 
 
 @dataclass(frozen=True)
@@ -221,7 +237,7 @@ def run_active_round(
     checkpoint_path = round_dir / "checkpoint.pth"
     metrics_path = round_dir / "metrics.json"
 
-    scoring_seed = derive_seed(seed, round_index, spec.name, spec.semantics_version)
+    pool_seed = derive_pool_seed(seed, round_index)
     identifier = run_id or f"{spec.name}-s{seed}-r{round_index}"
 
     manifest: dict[str, Any] = {
@@ -232,7 +248,7 @@ def run_active_round(
         "semantics_version": spec.semantics_version,
         "strategy_spec": spec.as_dict(),
         "seed": seed,
-        "scoring_seed": scoring_seed,
+        "pool_seed": pool_seed,
         "budget": budget,
         "input_checkpoint": str(checkpoint),
         "output_checkpoint": checkpoint_path.name,
@@ -289,7 +305,7 @@ def run_active_round(
                 confidence=candidate_batch.confidence,
                 posterior=candidate_batch.posterior,
                 predicted_labels=candidate_batch.predicted_labels,
-                seed=scoring_seed,
+                seed=pool_seed,
                 compute_all_components=True,
             )
             selected = select_images(scoring.image_scores, budget=budget)

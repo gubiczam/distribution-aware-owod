@@ -24,7 +24,7 @@ import pytest
 from daowod.cli import main as cli_main
 from daowod.config import load_config
 from daowod.diagnostics import GROUND_TRUTH_FIELDS
-from daowod.experiment import ActiveLearningCampaign, derive_seed
+from daowod.experiment import ActiveLearningCampaign, derive_pool_seed, derive_seed
 from daowod.prob_adapter import ProposalBatch
 from daowod.simulation import simulate_pool
 
@@ -391,7 +391,7 @@ def test_round_artifacts_diagnostics_and_grouped_metrics_are_written(
     assert manifest["strategy_spec"]["normalisation"] == "rank"
     assert manifest["strategy_spec"]["top_k"] == 2
     assert manifest["semantics_version"] == 2
-    assert manifest["scoring_seed"] == derive_seed(0, 1, "full", 2)
+    assert manifest["pool_seed"] == derive_pool_seed(0, 1)
     assert manifest["grouped_metrics"]["U_Recall_grouped"] == pytest.approx(2 / 3)
 
     # A v1 round in the same campaign keeps pre-audit semantics.
@@ -473,8 +473,39 @@ def test_derive_seed_does_not_collide_across_seed_and_round(
     """The pre-audit derivation `seed + round_index` collided on these pairs."""
 
     assert derive_seed(0, 1, "full", 2) != derive_seed(1, 0, "full", 2)
-    assert derive_seed(0, 1, "full", 2) != derive_seed(0, 1, "rarity", 2)
     assert derive_seed(0, 1, "full", 2) == derive_seed(0, 1, "full", 2)
+
+
+def test_all_strategies_share_one_clustering_per_pool(
+    environment: dict[str, object],
+) -> None:
+    """The clustering partitions the pool; it is not part of a strategy.
+
+    Measured confound if it were: 0.280 of an apparent 0.462 selection
+    difference between v2:full and v2:full_no_coherence came from a differing
+    KMeans partition rather than from the coherence gate.
+    """
+
+    assert derive_pool_seed(0, 1) != derive_pool_seed(0, 2)
+    assert derive_pool_seed(0, 1) != derive_pool_seed(1, 1)
+
+    _run(environment)
+    output = Path(environment["output_dir"])
+    seeds_by_strategy = {}
+    for strategy in ("v2_full", "v1_full_p1"):
+        manifest = json.loads(
+            (output / "seed_0" / strategy / "round_01" / "round_manifest.json").read_text()
+        )
+        seeds_by_strategy[strategy] = manifest["pool_seed"]
+    assert len(set(seeds_by_strategy.values())) == 1, seeds_by_strategy
+    assert seeds_by_strategy["v2_full"] == derive_pool_seed(0, 1)
+
+    # Different rounds legitimately re-cluster: the pool has changed.
+    round_two = json.loads(
+        (output / "seed_0" / "v2_full" / "round_02" / "round_manifest.json").read_text()
+    )
+    assert round_two["pool_seed"] == derive_pool_seed(0, 2)
+    assert round_two["pool_seed"] != seeds_by_strategy["v2_full"]
 
 
 def test_cli_validate_reads_the_repository_configuration(

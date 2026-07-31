@@ -541,21 +541,34 @@ def uncertainty_comparison(
     budget: int | None = None,
     top_k: int = 3,
     top_fraction: float = 0.1,
+    objectness: ArrayLike | None = None,
 ) -> dict[str, object]:
     """Does posterior uncertainty carry information the unknown score does not?
 
     The audit's finding was Spearman(legacy uncertainty, unknown score) = +1.000.
     Any replacement must break that identity to be worth having.
+
+    ``objectness`` is exported by the bridge and is the observable proxy for "is
+    this proposal on an object at all". It is reported here because a method can
+    break the identity above and still be worse: on a PROB-calibrated pool plain
+    entropy prefers *background* queries, whose posteriors are diffuse.
     """
 
     from daowod import components  # local import keeps the module import-light
 
     unknown_score = np.asarray(confidence, dtype=np.float64)
+    objectness_values = np.asarray(objectness, dtype=np.float64) if objectness is not None else None
     methods = {
         method: components.compute_uncertainty(
             method=method, posterior=posterior, confidence=unknown_score
         )
-        for method in ("entropy", "margin", "one_minus_max", "legacy_prob_score")
+        for method in (
+            "entropy",
+            "margin",
+            "one_minus_max",
+            "objectness_weighted_entropy",
+            "legacy_prob_score",
+        )
     }
 
     top = max(1, int(round(unknown_score.size * top_fraction)))
@@ -576,6 +589,14 @@ def uncertainty_comparison(
             ),
             "is_monotone_in_unknown_score": bool(abs(spearman(values, unknown_score)) > 0.999),
         }
+        if objectness_values is not None:
+            correlation = spearman(values, objectness_values)
+            entry["spearman_with_objectness"] = correlation
+            # A method that anti-correlates with objectness spends the annotation
+            # budget on background clutter, however well calibrated it looks.
+            entry["prefers_low_objectness_proposals"] = bool(
+                not math.isnan(correlation) and correlation < -0.1
+            )
         if budget:
             method_images = select_images(
                 aggregate_image_scores(image_ids, values, method="top_k_mean", top_k=top_k),
@@ -601,6 +622,101 @@ def uncertainty_comparison(
         else "entropy carries ranking information the unknown score does not"
     )
     return report
+
+
+# --- Step 7: which image aggregation is actually usable? ---------------------
+
+
+def aggregation_stability(
+    scores_by_seed: Mapping[int, Mapping[str, ArrayLike]],
+    image_ids: ArrayLike,
+    *,
+    budget: int,
+    reference_strategy: str,
+    contrast_strategy: str,
+    methods: Sequence[str] = ("top_k_mean", "max", "mean", "noisy_or"),
+    top_k: int = 3,
+) -> list[dict[str, object]]:
+    """Signal-to-noise of each aggregation method at the selection boundary.
+
+    Motivated by a measured pathology: after rank normalisation the top image
+    scores saturate near 1.0, so on a 198-image pool the gap between the 10th and
+    11th ranked image was 0.0016 against a full score range of 0.34 — 0.5 % of
+    the range decided whether an image was annotated. That makes selection
+    hypersensitive to negligible score differences, which is why proposal-level
+    Spearman can be 0.98 while the selected sets barely overlap.
+
+    ``signal`` is how much the contrast strategy's selection differs from the
+    reference; ``noise`` is how much the reference's own selection moves between
+    seeds. A method is only usable when signal exceeds noise.
+    """
+
+    from daowod.scoring import IMAGE_AGGREGATIONS
+
+    unknown = [method for method in methods if method not in IMAGE_AGGREGATIONS]
+    if unknown:
+        raise ValueError(f"Unknown aggregation methods: {unknown}")
+
+    rows: list[dict[str, object]] = []
+    seeds = sorted(scores_by_seed)
+    for method in methods:
+        selections: dict[str, dict[int, list[str]]] = {}
+        boundary_ratios: list[float] = []
+        for strategy in (reference_strategy, contrast_strategy):
+            selections[strategy] = {}
+            for seed in seeds:
+                values = scores_by_seed[seed].get(strategy)
+                if values is None:
+                    continue
+                image_scores = aggregate_image_scores(image_ids, values, method=method, top_k=top_k)
+                selections[strategy][seed] = select_images(image_scores, budget=budget)
+                ordered = np.sort(np.asarray(list(image_scores.values())))[::-1]
+                if ordered.size > budget:
+                    span = float(ordered[0] - ordered[-1])
+                    gap = float(ordered[budget - 1] - ordered[budget])
+                    boundary_ratios.append(gap / span if span > 1e-12 else float("nan"))
+
+        reference = selections.get(reference_strategy, {})
+        contrast = selections.get(contrast_strategy, {})
+        noise = [
+            1.0 - jaccard(reference[a], reference[b])
+            for index, a in enumerate(seeds)
+            for b in seeds[index + 1 :]
+            if a in reference and b in reference
+        ]
+        signal = [
+            1.0 - jaccard(reference[seed], contrast[seed])
+            for seed in seeds
+            if seed in reference and seed in contrast
+        ]
+        mean_signal = float(np.mean(signal)) if signal else float("nan")
+        mean_noise = float(np.mean(noise)) if noise else float("nan")
+        rows.append(
+            {
+                "aggregation": method,
+                "top_k": top_k if method == "top_k_mean" else "",
+                "reference": reference_strategy,
+                "contrast": contrast_strategy,
+                "mean_boundary_gap_over_range": float(np.nanmean(boundary_ratios))
+                if boundary_ratios
+                else float("nan"),
+                "signal_strategy_difference": mean_signal,
+                "noise_seed_difference": mean_noise,
+                "signal_to_noise": (
+                    mean_signal / mean_noise
+                    if mean_noise and math.isfinite(mean_noise) and mean_noise > 1e-12
+                    else float("inf")
+                    if mean_signal and mean_signal > 0
+                    else float("nan")
+                ),
+                "usable": bool(
+                    math.isfinite(mean_signal)
+                    and math.isfinite(mean_noise)
+                    and mean_signal > mean_noise
+                ),
+            }
+        )
+    return rows
 
 
 # --- Step 2: strategy separation and power ----------------------------------

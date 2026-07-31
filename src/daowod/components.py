@@ -30,11 +30,18 @@ FloatArray = NDArray[np.float64]
 IntArray = NDArray[np.int64]
 BoolArray = NDArray[np.bool_]
 
-UncertaintyMethod = Literal["entropy", "margin", "one_minus_max", "legacy_prob_score"]
+UncertaintyMethod = Literal[
+    "entropy",
+    "margin",
+    "one_minus_max",
+    "objectness_weighted_entropy",
+    "legacy_prob_score",
+]
 UNCERTAINTY_METHODS: tuple[str, ...] = (
     "entropy",
     "margin",
     "one_minus_max",
+    "objectness_weighted_entropy",
     "legacy_prob_score",
 )
 
@@ -99,11 +106,44 @@ def compute_uncertainty(
 ) -> FloatArray:
     """Proposal uncertainty on an approximately [0, 1] scale.
 
-    ``entropy``           -sum p log(p + eps) / log(K)
-    ``margin``            1 - (p_top1 - p_top2)
-    ``one_minus_max``     1 - p_top1
-    ``legacy_prob_score`` 1 - |2c - 1| over the PROB unknown score (deprecated)
+    ``entropy``                     -sum p log(p + eps) / log(K)
+    ``margin``                      1 - (p_top1 - p_top2)
+    ``one_minus_max``               1 - p_top1
+    ``objectness_weighted_entropy`` sqrt(entropy * unknown score)
+    ``legacy_prob_score``           1 - |2c - 1| (deprecated, see audit S2)
+
+    A caution measured on a PROB-calibrated pool and recorded in
+    ``docs/decisions.md``: PROB's posterior is
+    ``objectness * sigmoid(class logits)``, renormalised. A *confident* unknown
+    detection therefore has a peaked posterior and **low** entropy, while a
+    background query has a diffuse posterior and **high** entropy. Plain
+    ``entropy`` consequently anti-correlates with a proposal actually sitting on
+    an object (point-biserial -0.39 on the calibrated pool, versus +0.78 for the
+    unknown score). ``objectness_weighted_entropy`` is the geometric mean of the
+    two, so a proposal must be both object-like and ambiguous to score highly.
+    Which of these to prefer is an empirical question for the real pool; the
+    diagnostics report the correlation with objectness for every method.
     """
+
+    if method == "objectness_weighted_entropy":
+        if confidence is None:
+            raise ValueError(
+                "objectness_weighted_entropy requires the unknown score "
+                "(confidence) as well as the posterior."
+            )
+        entropy = compute_uncertainty(method="entropy", posterior=posterior)
+        score = as_vector("confidence", confidence)
+        if entropy.shape != score.shape:
+            raise ValueError("confidence must match the posterior row count.")
+        # Both factors are rank-normalised before combining. A geometric mean of
+        # the *raw* values was measured to be dominated by the unknown score
+        # (Spearman 0.9997 with it), which reproduces exactly the S2 defect this
+        # method exists to avoid: the score spans orders of magnitude while
+        # entropy sits in a narrow band, so the raw product carries no entropy
+        # information. On ranks the two factors have equal influence.
+        from daowod.normalisation import normalise
+
+        return np.sqrt(normalise(entropy, "rank") * normalise(score, "rank"))
 
     if method == "legacy_prob_score":
         if confidence is None:
