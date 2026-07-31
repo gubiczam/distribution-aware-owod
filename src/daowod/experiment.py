@@ -1,24 +1,71 @@
-"""Multi-seed, multi-strategy contribution-A experiment runner."""
+"""The one active-learning loop.
+
+Before the audit there were two: ``run_active_round`` (used by the live campaign,
+restricted to three strategies) and ``ActiveLearningExperiment._run_single``
+(unused, untested, and the only caller of the grouped long-tail metrics). They
+had already diverged in seeding, artifacts and validation. There is now a single
+round implementation, driven by a :class:`~daowod.scoring.StrategySpec`, and a
+single campaign loop built on top of it.
+
+What each round writes, beyond the checkpoint and metrics:
+
+``round_manifest.json``   protocol, strategy spec, digests, counts, metrics
+``proposal_scores.csv``   per-proposal record (:mod:`daowod.diagnostics`)
+``image_scores.csv``      per-image aggregate scores
+``component_diagnostics.json``  rarity / coherence / gate diagnostics
+``grouped_metrics.json``  head / medium / tail recall and AP, when available
+"""
 
 import csv
+import hashlib
 import json
 import random
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
-import numpy as np
-
-from daowod.acquisition import (
-    AcquisitionResult,
-    aggregate_image_scores,
-    score_proposals,
-    select_images,
-)
-from daowod.config import AcquisitionConfig, ExperimentConfig
+from daowod import diagnostics as diag
+from daowod.config import EvaluationConfig, ExperimentConfig
 from daowod.dataset import DatasetState, build_long_tail_pool, file_sha256, read_image_ids
-from daowod.metrics import grouped_unknown_recall, load_detection_json
+from daowod.groups import ClassGroups
+from daowod.metrics import (
+    grouped_detection_metrics,
+    load_detection_json,
+    require_consistent_category_space,
+    validate_grouped_metrics,
+)
 from daowod.prob_adapter import ProbAdapter
+from daowod.scoring import ScoringResult, StrategySpec, score_pool, select_images
+
+PROTOCOL_VERSION = 2
+
+
+def derive_seed(*parts: object) -> int:
+    """A distinct, reproducible seed for every (seed, round, strategy) triple.
+
+    ``seed + round_index`` — the pre-audit derivation — collided across pairs:
+    (seed 0, round 1) and (seed 1, round 0) produced the same clustering.
+    """
+
+    payload = "|".join(str(part) for part in parts).encode("utf-8")
+    return int.from_bytes(hashlib.sha256(payload).digest()[:4], "big")
+
+
+@dataclass(frozen=True)
+class RoundResult:
+    """Everything one active-learning round produced."""
+
+    selected_image_ids: list[str]
+    remaining_candidate_ids: list[str]
+    labelled_ids: list[str]
+    checkpoint_path: Path
+    metrics_path: Path
+    round_manifest_path: Path
+    metrics: dict[str, Any]
+    grouped_metrics: dict[str, Any] = field(default_factory=dict)
+    scoring: ScoringResult | None = None
+    artifacts: dict[str, Path] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -44,60 +91,65 @@ def _write_ids(path: Path, image_ids: Sequence[str]) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def _write_json(path: Path, data: dict[str, object]) -> None:
+def _write_json(path: Path, data: Mapping[str, Any]) -> None:
     temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.write_text(
+        json.dumps(data, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8"
+    )
     temporary.replace(path)
 
 
-def _write_score_tables(
-    proposal_path: Path,
-    image_path: Path,
-    image_scores: dict[object, float],
-    proposal_image_ids: Sequence[object],
-    result: AcquisitionResult,
-    *,
-    rarity_bonus: np.ndarray,
-) -> None:
-    with proposal_path.open("w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(
-            file,
-            fieldnames=[
-                "image_id",
-                "uncertainty",
-                "novelty",
-                "rarity",
-                "coherence",
-                "rarity_bonus",
-                "score",
-            ],
-            lineterminator="\n",
-        )
-        writer.writeheader()
-        for index, image_id in enumerate(proposal_image_ids):
-            writer.writerow(
-                {
-                    "image_id": str(image_id),
-                    "uncertainty": float(result.uncertainty[index]),
-                    "novelty": float(result.novelty[index]),
-                    "rarity": float(result.rarity[index]),
-                    "coherence": float(result.coherence[index]),
-                    "rarity_bonus": float(rarity_bonus[index]),
-                    "score": float(result.scores[index]),
-                }
-            )
-
-    with image_path.open("w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(
-            file,
-            fieldnames=["image_id", "score"],
-            lineterminator="\n",
-        )
+def _write_image_scores(path: Path, image_scores: Mapping[str, float]) -> None:
+    with path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=["image_id", "score"], lineterminator="\n")
         writer.writeheader()
         for image_id, score in sorted(
             image_scores.items(), key=lambda item: (-item[1], str(item[0]))
         ):
             writer.writerow({"image_id": str(image_id), "score": float(score)})
+
+
+def compute_grouped_metrics(
+    metrics: Mapping[str, Any],
+    *,
+    class_groups: ClassGroups,
+    unknown_classes: Sequence[str],
+    known_classes: Sequence[str] = (),
+    known_class_groups: ClassGroups | None = None,
+    evaluation: EvaluationConfig | None = None,
+) -> dict[str, Any]:
+    """Decompose the official metrics into head / medium / tail groups.
+
+    Returns an empty mapping when the evaluator wrote no detections artifact, so
+    a caller can decide whether that is fatal (it is, by default).
+    """
+
+    settings = evaluation or EvaluationConfig()
+    detections_path = metrics.get("detections_path")
+    if not detections_path:
+        return {}
+    ground_truth, detections = load_detection_json(str(detections_path))
+    category_report = require_consistent_category_space(
+        ground_truth,
+        detections,
+        known_classes=known_classes,
+        unknown_classes=unknown_classes,
+        unknown_prediction_name=settings.unknown_prediction_name,
+    )
+    grouped = grouped_detection_metrics(
+        ground_truth,
+        detections,
+        unknown_classes=unknown_classes,
+        class_groups=class_groups,
+        known_classes=known_classes,
+        known_class_groups=known_class_groups,
+        unknown_prediction_name=settings.unknown_prediction_name,
+        iou_threshold=settings.iou_threshold,
+    )
+    validate_grouped_metrics(grouped)
+    grouped["category_space"] = category_report
+    grouped["detections_path"] = str(detections_path)
+    return grouped
 
 
 def run_active_round(
@@ -108,16 +160,28 @@ def run_active_round(
     reference_ids: Sequence[str],
     labelled_ids: Sequence[str],
     output_dir: str | Path,
-    strategy: str,
+    spec: StrategySpec,
     budget: int,
-    acquisition_config: AcquisitionConfig,
     seed: int,
     round_index: int = 0,
-) -> dict[str, object]:
-    """Run one detector-backed active-learning round."""
+    run_id: str = "",
+    class_groups: ClassGroups | None = None,
+    unknown_classes: Sequence[str] = (),
+    known_classes: Sequence[str] = (),
+    known_class_groups: ClassGroups | None = None,
+    evaluation: EvaluationConfig | None = None,
+    export_proposals_for_random: bool = False,
+) -> RoundResult:
+    """Run one detector-backed active-learning round with any strategy.
 
-    if strategy not in {"random", "rarity_no_coherence", "full"}:
-        raise ValueError("strategy must be 'random', 'rarity_no_coherence', or 'full'.")
+    Behaviour change from the pre-audit version, recorded in
+    ``docs/migration_strategies.md``: a random strategy no longer exports
+    proposals for the whole pool by default. The old code ran a full PROB forward
+    pass and discarded it, which was a quarter of the pilot campaign's inference
+    budget. Set ``export_proposals_for_random`` to restore the old artifacts.
+    """
+
+    settings = evaluation or EvaluationConfig()
     if budget < 1:
         raise ValueError("budget must be positive.")
 
@@ -126,7 +190,7 @@ def run_active_round(
     labelled = _unique_ids("labelled_ids", labelled_ids)
     if budget > len(candidates):
         raise ValueError("budget must not exceed candidate image count.")
-    if strategy != "random" and not references:
+    if not spec.random_selection and not references:
         raise ValueError("reference_ids must be non-empty for proposal scoring.")
     overlap = set(candidates) & set(references)
     if overlap:
@@ -140,8 +204,8 @@ def run_active_round(
     round_dir = Path(output_dir)
     manifest_path = round_dir / "round_manifest.json"
     if manifest_path.exists():
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if manifest.get("completed") is True:
+        existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if existing.get("completed") is True:
             raise ValueError(f"Completed round would be overwritten: {round_dir}")
     round_dir.mkdir(parents=True, exist_ok=True)
 
@@ -149,109 +213,107 @@ def run_active_round(
     reference_proposals_path = round_dir / "reference_proposals.npz"
     proposal_scores_path = round_dir / "proposal_scores.csv"
     image_scores_path = round_dir / "image_scores.csv"
+    diagnostics_path = round_dir / "component_diagnostics.json"
+    grouped_metrics_path = round_dir / "grouped_metrics.json"
     selected_path = round_dir / "selected_ids.txt"
     labelled_path = round_dir / "labelled_ids.txt"
     remaining_path = round_dir / "remaining_pool_ids.txt"
     checkpoint_path = round_dir / "checkpoint.pth"
     metrics_path = round_dir / "metrics.json"
 
-    manifest: dict[str, object] = {
-        "protocol_version": 1,
+    scoring_seed = derive_seed(seed, round_index, spec.name, spec.semantics_version)
+    identifier = run_id or f"{spec.name}-s{seed}-r{round_index}"
+
+    manifest: dict[str, Any] = {
+        "protocol_version": PROTOCOL_VERSION,
+        "run_id": identifier,
         "round_index": round_index,
-        "strategy": strategy,
+        "strategy": spec.name,
+        "semantics_version": spec.semantics_version,
+        "strategy_spec": spec.as_dict(),
         "seed": seed,
+        "scoring_seed": scoring_seed,
         "budget": budget,
         "input_checkpoint": str(checkpoint),
         "output_checkpoint": checkpoint_path.name,
         "candidate_count_before": len(candidates),
         "labelled_count_before": len(labelled),
         "reference_count": len(references),
-        "acquisition_parameters": {
-            "uncertainty_mode": acquisition_config.uncertainty_mode,
-            "pseudo_label_source": acquisition_config.pseudo_label_source,
-            "cluster_count": acquisition_config.cluster_count,
-            "neighbour_count": acquisition_config.neighbour_count,
-            "weights": vars(acquisition_config.weights),
-        },
         "image_aggregation": {
-            "method": "mean_top_k_proposal_scores",
-            "top_k": acquisition_config.top_k,
+            "method": spec.image_aggregation,
+            "top_k": spec.top_k,
         },
         "completed": False,
     }
     _write_json(manifest_path, manifest)
 
-    try:
-        candidate_batch = adapter.predict(
-            candidates,
-            checkpoint=checkpoint,
-            output_path=candidate_proposals_path,
-        )
-    except Exception as exc:
-        raise RuntimeError("candidate proposal export failed") from exc
-
+    scoring: ScoringResult | None = None
     selected: list[str]
-    if strategy == "random":
+
+    if spec.random_selection:
+        if export_proposals_for_random:
+            try:
+                adapter.predict(
+                    candidates, checkpoint=checkpoint, output_path=candidate_proposals_path
+                )
+            except Exception as exc:  # noqa: BLE001 - re-raised with context
+                raise RuntimeError("candidate proposal export failed") from exc
+        else:
+            manifest["candidate_proposals_skipped"] = (
+                "a random strategy needs no proposal scores; the forward pass was "
+                "skipped to save inference budget"
+            )
         shuffled = list(candidates)
-        random.Random(f"{seed}:{round_index}").shuffle(shuffled)
+        random.Random(f"{seed}:{round_index}:{spec.name}").shuffle(shuffled)
         selected = shuffled[:budget]
     else:
         try:
-            reference_batch = adapter.predict(
-                references,
-                checkpoint=checkpoint,
-                output_path=reference_proposals_path,
+            candidate_batch = adapter.predict(
+                candidates, checkpoint=checkpoint, output_path=candidate_proposals_path
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - re-raised with context
+            raise RuntimeError("candidate proposal export failed") from exc
+        try:
+            reference_batch = adapter.predict(
+                references, checkpoint=checkpoint, output_path=reference_proposals_path
+            )
+        except Exception as exc:  # noqa: BLE001 - re-raised with context
             raise RuntimeError("reference proposal export failed") from exc
 
         try:
-            scoring_strategy = "ungated_full" if strategy == "rarity_no_coherence" else "full"
-            acquisition = score_proposals(
-                strategy=scoring_strategy,
-                uncertainty_mode=acquisition_config.uncertainty_mode,
-                pseudo_label_source=acquisition_config.pseudo_label_source,
-                confidence=candidate_batch.confidence,
-                posterior=candidate_batch.posterior,
+            scoring = score_pool(
+                spec=spec,
+                image_ids=candidate_batch.image_ids,
                 embeddings=candidate_batch.embeddings,
                 reference_embeddings=reference_batch.embeddings,
+                confidence=candidate_batch.confidence,
+                posterior=candidate_batch.posterior,
                 predicted_labels=candidate_batch.predicted_labels,
-                cluster_count=acquisition_config.cluster_count,
-                neighbour_count=acquisition_config.neighbour_count,
-                seed=seed + round_index,
-                weights=acquisition_config.weights,
+                seed=scoring_seed,
+                compute_all_components=True,
             )
-            image_scores = aggregate_image_scores(
-                candidate_batch.image_ids,
-                acquisition.scores,
-                top_k=acquisition_config.top_k,
-            )
-            rarity_bonus = (
-                acquisition.rarity
-                if strategy == "rarity_no_coherence"
-                else acquisition.rarity
-                * np.power(acquisition.coherence, acquisition_config.weights.coherence_power)
-            )
-        except Exception as exc:
+            selected = select_images(scoring.image_scores, budget=budget)
+        except Exception as exc:  # noqa: BLE001 - re-raised with context
             raise RuntimeError("proposal scoring failed") from exc
 
-        _write_score_tables(
-            proposal_scores_path,
-            image_scores_path,
-            image_scores,
-            candidate_batch.image_ids,
-            acquisition,
-            rarity_bonus=rarity_bonus,
+        rows = diag.proposal_table(
+            scoring,
+            run_id=identifier,
+            seed=seed,
+            round_index=round_index,
+            selected_image_ids=selected,
+            posterior=candidate_batch.posterior,
+            confidence=candidate_batch.confidence,
+            predicted_labels=candidate_batch.predicted_labels,
         )
-        selected = [
-            str(image_id)
-            for image_id in select_images(
-                candidate_batch.image_ids,
-                acquisition.scores,
-                budget=budget,
-                top_k=acquisition_config.top_k,
-            )
-        ]
+        # Acquisition-time artifacts must never carry ground truth.
+        diag.assert_no_ground_truth(rows)
+        diag.write_rows(proposal_scores_path, rows)
+        _write_image_scores(image_scores_path, scoring.image_scores)
+        _write_json(
+            diagnostics_path,
+            diag.component_diagnostics(scoring, budget=budget),
+        )
 
     selected_set = set(selected)
     cumulative_labelled = [*labelled, *selected]
@@ -268,15 +330,36 @@ def run_active_round(
             round_index=round_index,
             seed=seed,
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - re-raised with context
         raise RuntimeError("training failed") from exc
     if Path(trained_checkpoint) != checkpoint_path:
         raise ValueError(f"Unexpected checkpoint path: {trained_checkpoint}")
 
     try:
         metrics = adapter.evaluate(checkpoint=checkpoint_path, output_path=metrics_path)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - re-raised with context
         raise RuntimeError("evaluation failed") from exc
+
+    grouped: dict[str, Any] = {}
+    if settings.grouped_metrics and class_groups is not None:
+        grouped = compute_grouped_metrics(
+            metrics,
+            class_groups=class_groups,
+            unknown_classes=unknown_classes,
+            known_classes=known_classes,
+            known_class_groups=known_class_groups,
+            evaluation=settings,
+        )
+        if not grouped and settings.require_detections:
+            raise RuntimeError(
+                "The evaluator wrote no 'detections_path', so head/medium/tail "
+                "metrics cannot be computed. Use a bridge that supports "
+                "'evaluate --detections-output', or set "
+                "evaluation.require_detections=false to proceed without grouped "
+                "metrics."
+            )
+        if grouped:
+            _write_json(grouped_metrics_path, grouped)
 
     manifest.update(
         {
@@ -285,259 +368,198 @@ def run_active_round(
             "selected_ids_sha256": file_sha256(selected_path),
             "remaining_pool_sha256": file_sha256(remaining_path),
             "labelled_ids_sha256": file_sha256(labelled_path),
-            "candidate_proposals_sha256": file_sha256(candidate_proposals_path),
+            "candidate_proposals_sha256": (
+                file_sha256(candidate_proposals_path) if candidate_proposals_path.exists() else None
+            ),
             "reference_proposals_sha256": (
                 file_sha256(reference_proposals_path) if reference_proposals_path.exists() else None
             ),
             "metrics": metrics,
+            "grouped_metrics": grouped or None,
+            "scoring_diagnostics": dict(scoring.diagnostics) if scoring else None,
             "completed": True,
         }
     )
     _write_json(manifest_path, manifest)
 
-    return {
-        "selected_image_ids": selected,
-        "remaining_candidate_ids": remaining,
-        "labelled_ids": cumulative_labelled,
-        "checkpoint_path": checkpoint_path,
-        "metrics_path": metrics_path,
-        "round_manifest_path": manifest_path,
+    artifacts = {
+        name: path
+        for name, path in (
+            ("candidate_proposals", candidate_proposals_path),
+            ("reference_proposals", reference_proposals_path),
+            ("proposal_scores", proposal_scores_path),
+            ("image_scores", image_scores_path),
+            ("component_diagnostics", diagnostics_path),
+            ("grouped_metrics", grouped_metrics_path),
+        )
+        if path.exists()
     }
 
+    return RoundResult(
+        selected_image_ids=selected,
+        remaining_candidate_ids=remaining,
+        labelled_ids=cumulative_labelled,
+        checkpoint_path=checkpoint_path,
+        metrics_path=metrics_path,
+        round_manifest_path=manifest_path,
+        metrics=dict(metrics),
+        grouped_metrics=grouped,
+        scoring=scoring,
+        artifacts=artifacts,
+    )
 
-class ActiveLearningExperiment:
-    """Run all configured strategies with identical seeds and budgets."""
+
+class ActiveLearningCampaign:
+    """Run every configured strategy over every seed through one round loop."""
 
     def __init__(self, config: ExperimentConfig, detector: ProbAdapter) -> None:
         self.config = config
         self.detector = detector
 
     def run(self) -> ExperimentResult:
-        """Run the complete contribution-A experiment campaign."""
-
         output_root = Path(self.config.output_dir)
         output_root.mkdir(parents=True, exist_ok=True)
-        base_image_ids = (
-            []
-            if self.config.dataset.long_tail.enabled
-            else read_image_ids(self.config.dataset.image_set_path)
-        )
+        _write_json(output_root / "experiment_config.json", self.config.as_dict())
+
         metrics_rows: list[dict[str, object]] = []
         selection_rows: list[dict[str, object]] = []
+        specs = self.config.acquisition.resolved_specs()
 
         for seed in self.config.active_learning.seeds:
-            pool = self._prepare_pool(
-                base_image_ids,
-                seed=seed,
-                output_root=output_root,
-            )
-            for strategy in self.config.acquisition.strategies:
-                metrics, selections = self._run_single(
-                    pool["selected_image_ids"],
-                    class_groups=pool["class_groups"],
+            pool = self._prepare_pool(seed=seed, output_root=output_root)
+            class_groups = self._class_groups(pool)
+            known_class_groups = self._known_class_groups()
+            for spec in specs:
+                rows, selections = self._run_strategy(
+                    spec,
+                    pool_ids=pool["selected_image_ids"],
+                    class_groups=class_groups,
+                    known_class_groups=known_class_groups,
                     seed=seed,
-                    strategy=strategy,
                     output_root=output_root,
                 )
-                metrics_rows.extend(metrics)
+                metrics_rows.extend(rows)
                 selection_rows.extend(selections)
 
-        self._write_csv(output_root / "metrics.csv", metrics_rows)
+        if metrics_rows:
+            diag.write_rows(output_root / "metrics.csv", metrics_rows)
         (output_root / "selections.json").write_text(
-            json.dumps(selection_rows, indent=2),
-            encoding="utf-8",
+            json.dumps(selection_rows, indent=2, default=str), encoding="utf-8"
         )
         return ExperimentResult(metrics_rows, selection_rows, output_root)
 
-    def _prepare_pool(
-        self,
-        image_ids: Sequence[str],
-        *,
-        seed: int,
-        output_root: Path,
-    ) -> dict[str, object]:
-        long_tail = self.config.dataset.long_tail
-        if not long_tail.enabled:
+    def _prepare_pool(self, *, seed: int, output_root: Path) -> dict[str, Any]:
+        dataset = self.config.dataset
+        if not dataset.long_tail.enabled:
             return {
-                "selected_image_ids": list(image_ids),
-                "class_groups": {name: "medium" for name in self.config.dataset.unknown_classes},
-                "manifest_path": None,
+                "selected_image_ids": read_image_ids(dataset.image_set_path),
                 "class_stats_path": None,
-                "pool_split_path": None,
             }
-
         return build_long_tail_pool(
-            annotation_dir=self.config.dataset.annotations_dir,
-            source_split=self.config.dataset.image_set_path,
-            task_class_names=self.config.dataset.unknown_classes,
+            annotation_dir=dataset.annotations_dir,
+            source_split=dataset.image_set_path,
+            task_class_names=dataset.unknown_classes,
             output_dir=output_root / f"long_tail_seed_{seed}",
-            imbalance_ratio=long_tail.imbalance_ratio,
+            imbalance_ratio=dataset.long_tail.imbalance_ratio,
             seed=seed,
         )
 
-    def _run_single(
+    def _class_groups(self, pool: Mapping[str, Any]) -> ClassGroups | None:
+        configured = self.config.dataset.class_groups_path
+        if configured:
+            return ClassGroups.from_class_stats_csv(configured)
+        stats_path = pool.get("class_stats_path")
+        if stats_path:
+            return ClassGroups.from_class_stats_csv(stats_path)
+        return None
+
+    def _known_class_groups(self) -> ClassGroups | None:
+        """Optional frequency grouping for the *known* classes.
+
+        Without it the known side of the grouped metrics is reported as "not
+        defined" rather than silently omitted, because the long-tail protocol
+        only assigns groups to the task (unknown) classes.
+        """
+
+        configured = self.config.dataset.known_class_groups_path
+        return ClassGroups.from_class_stats_csv(configured) if configured else None
+
+    def _run_strategy(
         self,
-        image_ids: Sequence[str],
+        spec: StrategySpec,
         *,
-        class_groups: dict[str, str],
+        pool_ids: Sequence[str],
+        class_groups: ClassGroups | None,
+        known_class_groups: ClassGroups | None,
         seed: int,
-        strategy: str,
         output_root: Path,
     ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
-        run_dir = output_root / f"seed_{seed}" / strategy
+        settings = self.config.active_learning
+        run_dir = output_root / f"seed_{seed}" / f"v{spec.semantics_version}_{spec.name}"
         run_dir.mkdir(parents=True, exist_ok=True)
-        state = DatasetState.initialise(
-            image_ids,
-            initial_images=self.config.active_learning.initial_images,
-            seed=seed,
-        )
-        checkpoint = self.config.prob.initial_checkpoint
+        state = DatasetState.initialise(pool_ids, initial_images=settings.initial_images, seed=seed)
+        checkpoint: str | Path | None = self.config.prob.initial_checkpoint
+        if checkpoint is None:
+            raise ValueError("prob.initial_checkpoint is required to run a campaign.")
+
         metrics_rows: list[dict[str, object]] = []
         selection_rows: list[dict[str, object]] = []
-        rng = np.random.default_rng(seed)
+        candidates = list(state.pool_ids)
+        labelled = list(state.labelled_ids)
 
-        for round_index in range(self.config.active_learning.rounds):
-            round_dir = run_dir / f"round_{round_index + 1}"
-            checkpoint = self.detector.train(
-                state.labelled_ids,
-                previous_checkpoint=checkpoint,
-                run_dir=round_dir,
-                round_index=round_index,
-                seed=seed,
-            )
-            metrics = self.detector.evaluate(
+        for round_index in range(1, settings.rounds + 1):
+            budget = min(settings.budget_per_round, len(candidates))
+            if budget < 1:
+                break
+            result = run_active_round(
+                adapter=self.detector,
                 checkpoint=checkpoint,
-                output_path=round_dir / "metrics.json",
+                candidate_ids=candidates,
+                reference_ids=labelled,
+                labelled_ids=[],
+                output_dir=run_dir / f"round_{round_index:02d}",
+                spec=spec,
+                budget=budget,
+                seed=seed,
+                round_index=round_index,
+                run_id=f"{self.config.name}-{spec.name}-s{seed}-r{round_index}",
+                class_groups=class_groups,
+                unknown_classes=self.config.dataset.unknown_classes,
+                known_classes=self.config.dataset.known_classes,
+                known_class_groups=known_class_groups,
+                evaluation=self.config.evaluation,
             )
-
-            detections_path = metrics.get("detections_path")
-            if detections_path:
-                ground_truth, detections = load_detection_json(str(detections_path))
-                metrics.update(
-                    grouped_unknown_recall(
-                        ground_truth,
-                        detections,
-                        unknown_classes=self.config.dataset.unknown_classes,
-                        class_groups=class_groups,
-                    )
-                )
-
             metrics_rows.append(
                 {
-                    "strategy": strategy,
+                    "strategy": spec.name,
+                    "semantics_version": spec.semantics_version,
                     "seed": seed,
-                    "round": round_index + 1,
-                    "labelled_images": len(state.labelled_ids),
-                    **metrics,
+                    "round": round_index,
+                    "cumulative_budget": round_index * settings.budget_per_round,
+                    "labelled_images": len(labelled) + len(result.selected_image_ids),
+                    **{
+                        key: value
+                        for key, value in result.metrics.items()
+                        if isinstance(value, (int, float, str)) or value is None
+                    },
+                    **{
+                        key: value
+                        for key, value in result.grouped_metrics.items()
+                        if isinstance(value, (int, float, str)) or value is None
+                    },
                 }
             )
-
-            is_last = round_index == self.config.active_learning.rounds - 1
-            if is_last or not state.pool_ids:
-                break
-
-            budget = min(
-                self.config.active_learning.budget_per_round,
-                len(state.pool_ids),
-            )
-            if strategy == "random":
-                selected = [
-                    str(value)
-                    for value in rng.choice(
-                        state.pool_ids,
-                        size=budget,
-                        replace=False,
-                    ).tolist()
-                ]
-            else:
-                candidates = self.detector.predict(
-                    state.pool_ids,
-                    checkpoint=checkpoint,
-                    output_path=round_dir / "candidate_proposals.npz",
-                )
-                references = self.detector.predict(
-                    state.labelled_ids,
-                    checkpoint=checkpoint,
-                    output_path=round_dir / "reference_proposals.npz",
-                )
-                acquisition = score_proposals(
-                    strategy=strategy,
-                    uncertainty_mode=self.config.acquisition.uncertainty_mode,
-                    pseudo_label_source=self.config.acquisition.pseudo_label_source,
-                    confidence=candidates.confidence,
-                    posterior=candidates.posterior,
-                    embeddings=candidates.embeddings,
-                    reference_embeddings=references.embeddings,
-                    predicted_labels=candidates.predicted_labels,
-                    cluster_count=self.config.acquisition.cluster_count,
-                    neighbour_count=self.config.acquisition.neighbour_count,
-                    seed=seed + round_index,
-                    weights=self.config.acquisition.weights,
-                )
-                selected = [
-                    str(value)
-                    for value in select_images(
-                        candidates.image_ids,
-                        acquisition.scores,
-                        budget=budget,
-                        top_k=self.config.acquisition.top_k,
-                    )
-                ]
-                self._write_diagnostics(
-                    round_dir / "proposal_diagnostics.csv",
-                    candidates.image_ids,
-                    acquisition,
-                )
-
-            state.reveal(selected)
             selection_rows.append(
                 {
-                    "strategy": strategy,
+                    "strategy": spec.name,
+                    "semantics_version": spec.semantics_version,
                     "seed": seed,
-                    "after_round": round_index + 1,
-                    "selected_image_ids": selected,
+                    "after_round": round_index,
+                    "selected_image_ids": result.selected_image_ids,
                 }
             )
+            checkpoint = result.checkpoint_path
+            labelled = [*labelled, *result.selected_image_ids]
+            candidates = result.remaining_candidate_ids
 
         return metrics_rows, selection_rows
-
-    @staticmethod
-    def _write_diagnostics(
-        path: Path,
-        image_ids: np.ndarray,
-        result: AcquisitionResult,
-    ) -> None:
-        fields = [
-            "image_id",
-            "uncertainty",
-            "novelty",
-            "pseudo_label",
-            "rarity",
-            "coherence",
-            "score",
-        ]
-        with path.open("w", newline="", encoding="utf-8") as file:
-            writer = csv.DictWriter(file, fieldnames=fields)
-            writer.writeheader()
-            for index, image_id in enumerate(image_ids):
-                writer.writerow(
-                    {
-                        "image_id": image_id,
-                        "uncertainty": result.uncertainty[index],
-                        "novelty": result.novelty[index],
-                        "pseudo_label": result.pseudo_labels[index],
-                        "rarity": result.rarity[index],
-                        "coherence": result.coherence[index],
-                        "score": result.scores[index],
-                    }
-                )
-
-    @staticmethod
-    def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
-        if not rows:
-            return
-        fieldnames = list(dict.fromkeys(key for row in rows for key in row))
-        with path.open("w", newline="", encoding="utf-8") as file:
-            writer = csv.DictWriter(file, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(rows)

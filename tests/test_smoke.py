@@ -19,11 +19,12 @@ from daowod.acquisition import (
     score_proposals,
     select_images,
 )
-from daowod.config import AcquisitionConfig, load_config
+from daowod.config import AcquisitionConfig, ConfigError, load_config
 from daowod.dataset import DatasetState, build_long_tail_pool, file_sha256
 from daowod.experiment import run_active_round
 from daowod.metrics import Detection, GroundTruth, grouped_unknown_recall
 from daowod.prob_adapter import ProposalBatch
+from daowod.scoring import STRATEGY_REGISTRY, StrategySpec
 
 
 def _write_voc_xml(path: Path, class_names: list[str]) -> None:
@@ -180,6 +181,18 @@ class FakeAdapter:
         return metrics
 
 
+def _v1_spec(name: str, **overrides: object) -> StrategySpec:
+    """A pre-audit strategy spec, optionally with structural overrides.
+
+    Round tests use version-1 specs so their exact expected numbers still apply:
+    they are now end-to-end proof that the refactored round reproduces the
+    pre-audit formulas, not just that the scorer does.
+    """
+
+    spec = STRATEGY_REGISTRY.resolve(name, semantics_version=1)
+    return StrategySpec(**{**spec.as_dict(), **overrides})
+
+
 def test_coherence_gates_only_rarity() -> None:
     scores = compute_proposal_scores(
         strategy="full",
@@ -334,14 +347,11 @@ def test_dataset_state_reveal() -> None:
     assert selected[0] not in state.pool_ids
 
 
-def test_load_config_accepts_multi_round_and_variant_strategy(tmp_path: Path) -> None:
-    config_path = tmp_path / "experiment.yaml"
-    config_path.write_text(
-        """
+_CONFIG_TEMPLATE = """
 name: multi-round
 active_learning:
   rounds: 2
-  strategy: rarity_no_coherence
+  strategy: {strategy}
   budget: 3
   initial_images: 2
   budget_per_round: 2
@@ -350,8 +360,7 @@ active_learning:
     - 1
 acquisition:
   strategies:
-    - rarity_no_coherence
-    - full
+{strategies}
   uncertainty_mode: entropy
   pseudo_label_source: predicted
   cluster_count: 4
@@ -374,21 +383,72 @@ dataset:
 prob:
   repository_path: /tmp/prob
   initial_checkpoint: /tmp/checkpoint.pth
-  train_command: python train.py
-  predict_command: python predict.py
-  evaluate_command: python evaluate.py
+  train_command: python train.py --labelled-ids {{labelled_ids}} --output-checkpoint {{checkpoint}}
+  predict_command: python predict.py --image-ids {{image_ids}} --output {{proposals}}
+  evaluate_command: python evaluate.py --checkpoint {{checkpoint}} --output {{metrics}}
 output_dir: outputs/test
-""".strip()
+"""
+
+
+def _write_config(tmp_path: Path, *, strategy: str, strategies: list[str]) -> Path:
+    config_path = tmp_path / "experiment.yaml"
+    config_path.write_text(
+        _CONFIG_TEMPLATE.format(
+            strategy=strategy,
+            strategies="\n".join(f"    - {name}" for name in strategies),
+        ).strip()
         + "\n",
         encoding="utf-8",
     )
+    return config_path
 
-    config = load_config(config_path)
+
+def test_load_config_requires_explicit_semantics_for_ambiguous_names(
+    tmp_path: Path,
+) -> None:
+    """Intentional safety break: 'full' means two different things now."""
+
+    path = _write_config(
+        tmp_path, strategy="v1:rarity_no_coherence", strategies=["v1:rarity_no_coherence", "full"]
+    )
+    with pytest.raises(ConfigError, match="different semantics"):
+        load_config(path)
+
+    ambiguous_single = _write_config(
+        tmp_path, strategy="full", strategies=["v1:rarity_no_coherence"]
+    )
+    with pytest.raises(ConfigError, match="different semantics"):
+        load_config(ambiguous_single)
+
+
+def test_load_config_accepts_multi_round_and_versioned_strategies(tmp_path: Path) -> None:
+    path = _write_config(
+        tmp_path,
+        strategy="v1:rarity_no_coherence",
+        strategies=["v1:rarity_no_coherence", "v1:full", "v2:full"],
+    )
+    config = load_config(path)
 
     assert config.active_learning.rounds == 2
-    assert config.active_learning.strategy == "rarity_no_coherence"
-    assert config.acquisition.strategies == ("rarity_no_coherence", "full")
+    assert config.active_learning.strategy == "v1:rarity_no_coherence"
+    assert config.acquisition.strategies == ("v1:rarity_no_coherence", "v1:full", "v2:full")
     assert config.acquisition.weights.coherence_power == pytest.approx(0.7)
+
+    specs = config.acquisition.resolved_specs()
+    assert [spec.semantics_version for spec in specs] == [1, 1, 2]
+    # A v1 spec keeps its pre-audit definitions even though the config asks for
+    # entropy and predicted pseudo-labels: reproducibility beats consistency here.
+    assert specs[0].uncertainty_method == "legacy_prob_score"
+    assert specs[0].pseudo_label_source == "cluster"
+    # The v2 spec picks up every override, including the coherence exponent that
+    # legacy configs expressed as weights.coherence_power.
+    assert specs[2].uncertainty_method == "entropy"
+    assert specs[2].pseudo_label_source == "predicted"
+    assert specs[2].cluster_count == 4
+    assert specs[2].top_k == 2
+    assert specs[2].coherence_exponent == pytest.approx(0.7)
+    # The config fingerprint changes when the resolved specs change.
+    assert len(config.fingerprint()) == 64
 
 
 def test_proposal_batch_npz_schema(tmp_path: Path) -> None:
@@ -552,16 +612,15 @@ def test_run_active_round_full_is_deterministic_and_reveals_complete_images(
         raise AssertionError("active acquisition must not parse candidate XML")
 
     monkeypatch.setattr("xml.etree.ElementTree.parse", fail_xml_parse)
-    acquisition = AcquisitionConfig(cluster_count=1, neighbour_count=1, top_k=1)
+    spec = _v1_spec("full", cluster_count=1, neighbour_count=1, top_k=1)
     adapter = FakeAdapter()
     round_args = {
         "checkpoint": "current.pth",
         "candidate_ids": ["candidate"],
         "reference_ids": ["reference"],
         "labelled_ids": ["already_labelled"],
-        "strategy": "full",
+        "spec": spec,
         "budget": 1,
-        "acquisition_config": acquisition,
         "seed": 7,
     }
 
@@ -576,10 +635,10 @@ def test_run_active_round_full_is_deterministic_and_reveals_complete_images(
         **round_args,
     )
 
-    assert first["selected_image_ids"] == ["candidate"]
-    assert second["selected_image_ids"] == first["selected_image_ids"]
-    assert first["remaining_candidate_ids"] == []
-    assert first["labelled_ids"] == ["already_labelled", "candidate"]
+    assert first.selected_image_ids == ["candidate"]
+    assert second.selected_image_ids == first.selected_image_ids
+    assert first.remaining_candidate_ids == []
+    assert first.labelled_ids == ["already_labelled", "candidate"]
     assert adapter.predict_calls == [(["candidate"], "current.pth"), (["reference"], "current.pth")]
     assert adapter.train_calls == [["already_labelled", "candidate"]]
     assert adapter.evaluate_calls == [str(tmp_path / "first" / "checkpoint.pth")]
@@ -599,14 +658,14 @@ def test_run_active_round_full_is_deterministic_and_reveals_complete_images(
     with (tmp_path / "first" / "proposal_scores.csv").open(newline="", encoding="utf-8") as file:
         score_row = next(csv.DictReader(file))
     expected_score = (
-        acquisition.weights.uncertainty * float(score_row["uncertainty"])
-        + acquisition.weights.novelty * float(score_row["novelty"])
-        + acquisition.weights.rarity * float(score_row["rarity_bonus"])
+        spec.uncertainty_weight * float(score_row["norm_uncertainty"])
+        + spec.novelty_weight * float(score_row["norm_novelty"])
+        + spec.gated_weight * float(score_row["raw_gated"])
     )
-    assert float(score_row["coherence"]) == pytest.approx(0.0)
-    assert float(score_row["rarity_bonus"]) == pytest.approx(0.0)
-    assert float(score_row["score"]) == pytest.approx(expected_score)
-    assert float(score_row["score"]) > 0
+    assert float(score_row["raw_coherence"]) == pytest.approx(0.0)
+    assert float(score_row["raw_gated"]) == pytest.approx(0.0)
+    assert float(score_row["proposal_score"]) == pytest.approx(expected_score)
+    assert float(score_row["proposal_score"]) > 0
 
     manifest = json.loads((tmp_path / "first" / "round_manifest.json").read_text(encoding="utf-8"))
     assert manifest["completed"] is True
@@ -642,32 +701,41 @@ def test_run_active_round_rarity_no_coherence_completes_and_scores_without_gate(
         reference_ids=reference_ids,
         labelled_ids=["labelled"],
         output_dir=tmp_path / "rarity",
-        strategy="rarity_no_coherence",
-        budget=2,
-        acquisition_config=AcquisitionConfig(
+        spec=_v1_spec(
+            "rarity_no_coherence",
             pseudo_label_source="predicted",
             neighbour_count=1,
             top_k=2,
         ),
+        budget=2,
         seed=11,
     )
 
-    assert result["selected_image_ids"] == ["img_c", "img_b"]
-    assert result["remaining_candidate_ids"] == ["img_a"]
-    assert result["labelled_ids"] == ["labelled", "img_c", "img_b"]
+    assert result.selected_image_ids == ["img_c", "img_b"]
+    assert result.remaining_candidate_ids == ["img_a"]
+    assert result.labelled_ids == ["labelled", "img_c", "img_b"]
     assert adapter.predict_calls == [(candidate_ids, "current.pth"), (reference_ids, "current.pth")]
     assert adapter.train_calls == [["labelled", "img_c", "img_b"]]
     assert adapter.evaluate_calls == [str(tmp_path / "rarity" / "checkpoint.pth")]
 
     with (tmp_path / "rarity" / "proposal_scores.csv").open(newline="", encoding="utf-8") as file:
         proposal_rows = list(csv.DictReader(file))
-    assert [float(row["score"]) for row in proposal_rows] == pytest.approx([0.3, 0.24, 0.76, 0.87])
+    assert [float(row["proposal_score"]) for row in proposal_rows] == pytest.approx(
+        [0.3, 0.24, 0.76, 0.87]
+    )
+    # Ungatedness, tested three ways rather than by inspecting a derived column.
+    # (`raw_gated` is now always the gated interaction; a strategy is ungated
+    # because its gated_weight is zero, not because that column equals rarity.)
+    spec = _v1_spec(
+        "rarity_no_coherence", pseudo_label_source="predicted", neighbour_count=1, top_k=2
+    )
+    assert spec.gated_weight == 0.0
+    assert spec.rarity_weight == pytest.approx(0.5)
     for row in proposal_rows:
-        assert float(row["rarity_bonus"]) == pytest.approx(float(row["rarity"]))
-        assert float(row["score"]) == pytest.approx(
-            0.3 * float(row["uncertainty"])
-            + 0.2 * float(row["novelty"])
-            + 0.5 * float(row["rarity"])
+        assert float(row["proposal_score"]) == pytest.approx(
+            0.3 * float(row["norm_uncertainty"])
+            + 0.2 * float(row["norm_novelty"])
+            + 0.5 * float(row["norm_rarity"])
         )
 
     with (tmp_path / "rarity" / "image_scores.csv").open(newline="", encoding="utf-8") as file:
@@ -694,6 +762,63 @@ def test_run_active_round_rarity_no_coherence_completes_and_scores_without_gate(
     }
 
 
+def test_ungated_strategy_scores_are_invariant_to_the_coherence_method(
+    tmp_path: Path,
+) -> None:
+    """An ungated strategy must not depend on coherence at all.
+
+    Stronger than comparing a derived CSV column: the coherence definition is
+    swapped for one that produces very different values, and the scores must be
+    bit-identical.
+    """
+
+    candidate_ids = ["img_a", "img_b", "img_c"]
+    reference_ids = ["ref"]
+    scores_by_method = {}
+    for method in ("density", "relative_within_cluster", "neighbour_consistency"):
+        run_active_round(
+            adapter=FakeAdapter(
+                proposal_batches={
+                    tuple(candidate_ids): _round_candidate_batch(),
+                    tuple(reference_ids): _round_reference_batch(),
+                }
+            ),
+            checkpoint="current.pth",
+            candidate_ids=candidate_ids,
+            reference_ids=reference_ids,
+            labelled_ids=["labelled"],
+            output_dir=tmp_path / method,
+            spec=_v1_spec(
+                "rarity_no_coherence",
+                pseudo_label_source="predicted",
+                neighbour_count=1,
+                top_k=2,
+                coherence_method=method,
+            ),
+            budget=2,
+            seed=11,
+        )
+        with (tmp_path / method / "proposal_scores.csv").open(newline="", encoding="utf-8") as file:
+            rows = list(csv.DictReader(file))
+        scores_by_method[method] = [float(row["proposal_score"]) for row in rows]
+        coherence = [float(row["raw_coherence"]) for row in rows]
+        assert coherence == pytest.approx(coherence)  # finite
+
+    # The coherence values genuinely differ between methods ...
+    with (tmp_path / "density" / "proposal_scores.csv").open(newline="", encoding="utf-8") as file:
+        density_coherence = [float(row["raw_coherence"]) for row in csv.DictReader(file)]
+    with (tmp_path / "neighbour_consistency" / "proposal_scores.csv").open(
+        newline="", encoding="utf-8"
+    ) as file:
+        consistency_coherence = [float(row["raw_coherence"]) for row in csv.DictReader(file)]
+    assert density_coherence != pytest.approx(consistency_coherence)
+
+    # ... yet the ungated scores are identical, and equal the legacy formula.
+    assert scores_by_method["density"] == pytest.approx([0.3, 0.24, 0.76, 0.87])
+    for method, values in scores_by_method.items():
+        assert values == pytest.approx(scores_by_method["density"]), method
+
+
 def test_run_active_round_full_regression_scores_image_scores_and_selection(
     tmp_path: Path,
 ) -> None:
@@ -711,22 +836,22 @@ def test_run_active_round_full_regression_scores_image_scores_and_selection(
         reference_ids=reference_ids,
         labelled_ids=[],
         output_dir=tmp_path / "full",
-        strategy="full",
-        budget=2,
-        acquisition_config=AcquisitionConfig(
+        spec=_v1_spec(
+            "full",
             pseudo_label_source="predicted",
             neighbour_count=1,
             top_k=2,
         ),
+        budget=2,
         seed=11,
     )
 
     with (tmp_path / "full" / "proposal_scores.csv").open(newline="", encoding="utf-8") as file:
         proposal_rows = list(csv.DictReader(file))
-    assert [float(row["score"]) for row in proposal_rows] == pytest.approx(
+    assert [float(row["proposal_score"]) for row in proposal_rows] == pytest.approx(
         [0.3, 0.24, 0.42666666666666664, 0.5366666666666666]
     )
-    assert [float(row["rarity_bonus"]) for row in proposal_rows] == pytest.approx(
+    assert [float(row["raw_gated"]) for row in proposal_rows] == pytest.approx(
         [0.0, 0.0, 0.3333333333333333, 0.3333333333333333]
     )
 
@@ -748,9 +873,8 @@ def test_run_active_round_random_is_seeded_locally(tmp_path: Path) -> None:
         "candidate_ids": ["a", "b", "c", "d"],
         "reference_ids": [],
         "labelled_ids": [],
-        "strategy": "random",
+        "spec": STRATEGY_REGISTRY.resolve("random"),
         "budget": 2,
-        "acquisition_config": AcquisitionConfig(),
         "seed": 5,
         "round_index": 1,
     }
@@ -769,12 +893,14 @@ def test_run_active_round_random_is_seeded_locally(tmp_path: Path) -> None:
     )
 
     assert before == after
-    assert first["selected_image_ids"] == second["selected_image_ids"]
-    assert set(first["remaining_candidate_ids"]).isdisjoint(first["selected_image_ids"])
-    assert first["labelled_ids"] == first["selected_image_ids"]
+    assert first.selected_image_ids == second.selected_image_ids
+    assert set(first.remaining_candidate_ids).isdisjoint(first.selected_image_ids)
+    assert first.labelled_ids == first.selected_image_ids
     assert not (tmp_path / "first_random" / "proposal_scores.csv").exists()
     assert not (tmp_path / "first_random" / "image_scores.csv").exists()
     assert not (tmp_path / "first_random" / "reference_proposals.npz").exists()
+    # Behaviour change: a random strategy no longer exports proposals it discards.
+    assert not (tmp_path / "first_random" / "candidate_proposals.npz").exists()
 
 
 def test_run_active_round_rejects_invalid_inputs_and_completed_output(tmp_path: Path) -> None:
@@ -785,13 +911,30 @@ def test_run_active_round_rejects_invalid_inputs_and_completed_output(tmp_path: 
         "reference_ids": ["r"],
         "labelled_ids": [],
         "output_dir": tmp_path / "round",
-        "strategy": "full",
+        "spec": _v1_spec("full", cluster_count=1),
         "budget": 1,
-        "acquisition_config": AcquisitionConfig(cluster_count=1),
         "seed": 0,
     }
-    with pytest.raises(ValueError, match="strategy"):
-        run_active_round(**{**kwargs, "strategy": "uncertainty"})
+    # Every registry strategy is now runnable in the live loop, so the old
+    # three-strategy allowlist is gone. What must still fail loudly is a strategy
+    # whose uncertainty method needs a posterior the export does not carry.
+    with pytest.raises(RuntimeError, match="proposal scoring failed"):
+        run_active_round(
+            **{
+                **kwargs,
+                "adapter": FakeAdapter(
+                    proposal_batches={
+                        ("a",): ProposalBatch(
+                            image_ids=np.array(["a"], dtype=object),
+                            confidence=np.array([0.5]),
+                            embeddings=np.array([[1.0, 0.0]]),
+                        ).validate()
+                    }
+                ),
+                "output_dir": tmp_path / "no_posterior",
+                "spec": STRATEGY_REGISTRY.resolve("v2:uncertainty"),
+            }
+        )
     with pytest.raises(ValueError, match="budget"):
         run_active_round(**{**kwargs, "budget": 0})
     with pytest.raises(ValueError, match="budget"):
@@ -808,9 +951,8 @@ def test_run_active_round_failures_keep_exports_and_incomplete_manifest(tmp_path
         "candidate_ids": ["candidate"],
         "reference_ids": ["reference"],
         "labelled_ids": [],
-        "strategy": "full",
+        "spec": _v1_spec("full", cluster_count=1),
         "budget": 1,
-        "acquisition_config": AcquisitionConfig(cluster_count=1),
         "seed": 0,
     }
 

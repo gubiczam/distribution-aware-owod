@@ -1,4 +1,22 @@
-"""Distribution-aware active-learning acquisition for contribution A."""
+"""Backward-compatibility shim for the pre-audit acquisition API.
+
+Every function here delegates to :mod:`daowod.components`,
+:mod:`daowod.normalisation` and :mod:`daowod.scoring`. There is no second
+implementation of any formula: the weighted sums all route through
+:func:`daowod.scoring.combine_components`, and the component maths lives in
+:mod:`daowod.components`. What this module still owns is the *version-1
+conventions* — which component is min-maxed, which is not, and which legacy entry
+point weight-normalises — so previously published numbers stay reproducible.
+
+New code should use :func:`daowod.scoring.score_pool` with a
+:class:`~daowod.scoring.StrategySpec`. See ``docs/migration_strategies.md``.
+
+One historical quirk is preserved deliberately: ``compute_proposal_scores`` and
+``_offline_strategy_scores`` disagree about ``uncertainty_novelty``. The online
+formula divides by ``alpha + beta``; the offline one does not. That drift is what
+the audit found, and both are kept under their own names rather than silently
+unified, because published offline comparisons used the un-normalised form.
+"""
 
 import csv
 import json
@@ -10,10 +28,12 @@ from typing import Literal
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
-from sklearn.cluster import KMeans
-from sklearn.neighbors import NearestNeighbors
 
+from daowod import components
+from daowod.normalisation import normalise
 from daowod.prob_adapter import ProposalBatch
+from daowod.scoring import StrategySpec, combine_components
+from daowod.scoring import aggregate_image_scores as _canonical_aggregate
 
 FloatArray = NDArray[np.float64]
 IntArray = NDArray[np.int64]
@@ -27,6 +47,21 @@ Strategy = Literal[
 ]
 UncertaintyMode = Literal["ambiguity", "entropy", "margin"]
 PseudoLabelSource = Literal["cluster", "predicted"]
+
+#: Version-1 normalisation conventions: uncertainty and coherence raw, novelty
+#: and rarity min-maxed. Recorded once, used by every legacy entry point.
+LEGACY_COMPONENT_NORMALISATION: dict[str, str] = {
+    "uncertainty": "none",
+    "novelty": "minmax",
+    "rarity": "minmax",
+    "coherence": "none",
+    "gated": "none",
+}
+_UNCERTAINTY_MODE_TO_METHOD: dict[str, str] = {
+    "ambiguity": "legacy_prob_score",
+    "entropy": "entropy",
+    "margin": "margin",
+}
 
 
 @dataclass(frozen=True)
@@ -58,36 +93,88 @@ class AcquisitionResult:
 
 
 def _vector(name: str, values: ArrayLike) -> FloatArray:
-    result = np.asarray(values, dtype=np.float64)
-    if result.ndim != 1 or not np.all(np.isfinite(result)):
-        raise ValueError(f"{name} must be a finite one-dimensional array.")
-    return result
+    return components.as_vector(name, values)
 
 
 def _matrix(name: str, values: ArrayLike) -> FloatArray:
-    result = np.asarray(values, dtype=np.float64)
-    if result.ndim != 2 or result.shape[1] == 0:
-        raise ValueError(f"{name} must be a non-empty two-dimensional matrix.")
-    if not np.all(np.isfinite(result)):
-        raise ValueError(f"{name} must contain finite values.")
-    return result
+    return components.as_matrix(name, values)
 
 
 def _normalise_rows(values: ArrayLike) -> FloatArray:
-    matrix = _matrix("embeddings", values)
-    if matrix.shape[0] == 0:
-        return matrix.copy()
-    return matrix / np.maximum(np.linalg.norm(matrix, axis=1, keepdims=True), 1e-12)
+    return components.normalise_rows(values)
 
 
 def _minmax(values: ArrayLike) -> FloatArray:
-    result = _vector("values", values)
-    if result.size == 0:
-        return result.copy()
-    low, high = float(result.min()), float(result.max())
-    if high - low < 1e-12:
-        return np.ones_like(result)
-    return (result - low) / (high - low)
+    return normalise(components.as_vector("values", values), "minmax")
+
+
+def _legacy_spec(
+    name: str,
+    weights: AcquisitionWeights,
+    *,
+    uncertainty_mode: str = "ambiguity",
+    pseudo_label_source: str = "cluster",
+    cluster_count: int = 20,
+    neighbour_count: int = 5,
+    top_k: int = 3,
+    weight_normalise_uncertainty_novelty: bool = True,
+) -> StrategySpec:
+    """Build the version-1 spec for one legacy strategy name."""
+
+    method = _UNCERTAINTY_MODE_TO_METHOD.get(uncertainty_mode)
+    if method is None:
+        raise ValueError(f"Unknown uncertainty mode: {uncertainty_mode}")
+
+    shared: dict[str, object] = {
+        "semantics_version": 1,
+        "uncertainty_method": method,
+        "rarity_method": "inverse_frequency",
+        "rarity_power": weights.rarity_power,
+        "coherence_method": "density",
+        "coherence_exponent": weights.coherence_power,
+        "normalisation": "minmax",
+        "component_normalisation": LEGACY_COMPONENT_NORMALISATION,
+        "pseudo_label_source": pseudo_label_source,
+        "cluster_count": cluster_count,
+        "neighbour_count": neighbour_count,
+        "image_aggregation": "top_k_mean",
+        "top_k": top_k,
+    }
+    if name == "random":
+        return StrategySpec(name="random", semantics_version=1, random_selection=True)
+    if name == "uncertainty":
+        return StrategySpec(name=name, uncertainty_weight=1.0, **shared)
+    if name == "uncertainty_novelty":
+        if weights.uncertainty + weights.novelty == 0:
+            raise ValueError("Uncertainty or novelty weight must be positive.")
+        return StrategySpec(
+            name=name,
+            uncertainty_weight=weights.uncertainty,
+            novelty_weight=weights.novelty,
+            weight_normalise=weight_normalise_uncertainty_novelty,
+            **shared,
+        )
+    if name == "rarity":
+        return StrategySpec(name=name, rarity_weight=1.0, **shared)
+    if name == "rarity_coherence":
+        return StrategySpec(name=name, gated_weight=1.0, **shared)
+    if name in ("ungated_full", "rarity_no_coherence"):
+        return StrategySpec(
+            name=name,
+            uncertainty_weight=weights.uncertainty,
+            novelty_weight=weights.novelty,
+            rarity_weight=weights.rarity,
+            **shared,
+        )
+    if name == "full":
+        return StrategySpec(
+            name=name,
+            uncertainty_weight=weights.uncertainty,
+            novelty_weight=weights.novelty,
+            gated_weight=weights.rarity,
+            **shared,
+        )
+    raise ValueError(f"Unknown strategy: {name}")
 
 
 def compute_uncertainty(
@@ -96,48 +183,33 @@ def compute_uncertainty(
     posterior: ArrayLike | None = None,
     mode: UncertaintyMode = "ambiguity",
 ) -> FloatArray:
-    """Compute uncertainty from confidence or class posteriors."""
+    """Compute uncertainty from confidence or class posteriors (version 1).
 
-    if mode == "ambiguity":
-        if confidence is None:
-            raise ValueError("ambiguity requires confidence values.")
-        values = _vector("confidence", confidence)
-        if np.any((values < 0) | (values > 1)):
-            raise ValueError("confidence must be in [0, 1].")
-        return 1.0 - np.abs(2.0 * values - 1.0)
+    ``mode='ambiguity'`` is ``1 - |2c - 1|``, which the audit showed is a monotone
+    rescaling of the PROB unknown score. New code should use
+    :func:`daowod.components.compute_uncertainty` with ``method='entropy'``.
+    """
 
-    if posterior is None:
+    method = _UNCERTAINTY_MODE_TO_METHOD.get(mode)
+    if method is None:
+        raise ValueError(f"Unknown uncertainty mode: {mode}")
+    if method == "legacy_prob_score" and confidence is None:
+        raise ValueError("ambiguity requires confidence values.")
+    if method != "legacy_prob_score" and posterior is None:
         raise ValueError(f"{mode} requires posterior probabilities.")
-    probabilities = _matrix("posterior", posterior)
-    if probabilities.shape[1] < 2 or np.any(probabilities < 0):
-        raise ValueError("posterior must contain at least two non-negative classes.")
-    mass = probabilities.sum(axis=1, keepdims=True)
-    if np.any(mass <= 0):
-        raise ValueError("Every posterior row must have positive mass.")
-    probabilities = probabilities / mass
-
-    if mode == "entropy":
-        with np.errstate(divide="ignore", invalid="ignore"):
-            terms = np.where(probabilities > 0, probabilities * np.log(probabilities), 0.0)
-        return -terms.sum(axis=1) / np.log(probabilities.shape[1])
-    if mode == "margin":
-        ordered = np.sort(probabilities, axis=1)
-        return 1.0 - (ordered[:, -1] - ordered[:, -2])
-    raise ValueError(f"Unknown uncertainty mode: {mode}")
+    return components.compute_uncertainty(method=method, posterior=posterior, confidence=confidence)
 
 
 def compute_novelty(candidate_embeddings: ArrayLike, reference_embeddings: ArrayLike) -> FloatArray:
-    """Distance from the nearest labelled reference proposal."""
+    """Min-maxed distance from the nearest labelled reference proposal."""
 
-    candidates = _normalise_rows(candidate_embeddings)
-    references = _normalise_rows(reference_embeddings)
-    if candidates.shape[1] != references.shape[1]:
-        raise ValueError("Candidate and reference dimensions must match.")
-    if candidates.shape[0] == 0:
-        return np.empty(0, dtype=np.float64)
+    raw = components.compute_novelty(candidate_embeddings, reference_embeddings)
+    if raw.size == 0:
+        return raw
+    references = components.normalise_rows(reference_embeddings)
     if references.shape[0] == 0:
-        return np.ones(candidates.shape[0], dtype=np.float64)
-    return _minmax(1.0 - (candidates @ references.T).max(axis=1))
+        return raw
+    return normalise(raw, "minmax")
 
 
 def assign_pseudo_labels(
@@ -150,60 +222,34 @@ def assign_pseudo_labels(
 ) -> IntArray:
     """Estimate unknown classes before oracle annotation."""
 
-    vectors = _matrix("embeddings", embeddings)
-    count = vectors.shape[0]
-    if count == 0:
-        return np.empty(0, dtype=np.int64)
-    if source == "predicted":
-        if predicted_labels is None:
-            raise ValueError("Predicted pseudo-labels are unavailable.")
-        labels = np.asarray(predicted_labels, dtype=np.int64)
-        if labels.shape != (count,):
-            raise ValueError("predicted_labels must match proposal count.")
-        return labels
-    if source != "cluster" or cluster_count < 1:
+    if source == "predicted" and predicted_labels is None:
+        raise ValueError("Predicted pseudo-labels are unavailable.")
+    if source not in components.PSEUDO_LABEL_SOURCES or (source == "cluster" and cluster_count < 1):
         raise ValueError("Invalid pseudo-label configuration.")
-    return (
-        KMeans(
-            n_clusters=min(cluster_count, count),
-            random_state=seed,
-            n_init="auto",
-        )
-        .fit_predict(_normalise_rows(vectors))
-        .astype(np.int64)
+    return components.assign_pseudo_labels(
+        embeddings,
+        source=source,
+        cluster_count=cluster_count,
+        seed=seed,
+        predicted_labels=predicted_labels,
     )
 
 
 def compute_rarity(pseudo_labels: ArrayLike, *, rarity_power: float = 1.0) -> FloatArray:
-    """Estimate rarity as inverse pseudo-class frequency."""
+    """Min-maxed inverse pseudo-class frequency (version 1)."""
 
-    if rarity_power <= 0:
-        raise ValueError("rarity_power must be positive.")
-    labels = np.asarray(pseudo_labels, dtype=np.int64)
-    if labels.ndim != 1:
-        raise ValueError("pseudo_labels must be one-dimensional.")
-    if labels.size == 0:
-        return np.empty(0, dtype=np.float64)
-    _, inverse, counts = np.unique(labels, return_inverse=True, return_counts=True)
-    return _minmax(np.power(counts[inverse].astype(np.float64), -rarity_power))
+    raw = components.compute_rarity(
+        pseudo_labels, method="inverse_frequency", rarity_power=rarity_power
+    )
+    return raw if raw.size == 0 else normalise(raw, "minmax")
 
 
 def compute_coherence(embeddings: ArrayLike, *, neighbour_count: int = 5) -> FloatArray:
-    """Local support measured from the k-th nearest-neighbour distance."""
+    """Absolute local density from the k-th nearest-neighbour distance (version 1)."""
 
-    vectors = _normalise_rows(embeddings)
-    count = vectors.shape[0]
-    if neighbour_count < 1:
-        raise ValueError("neighbour_count must be positive.")
-    if count == 0:
-        return np.empty(0, dtype=np.float64)
-    if count == 1:
-        return np.zeros(1, dtype=np.float64)
-    k = min(neighbour_count, count - 1)
-    distances, _ = NearestNeighbors(n_neighbors=k + 1).fit(vectors).kneighbors(vectors)
-    kth_distance = distances[:, k]
-    scale = max(float(np.median(kth_distance)), 1e-12)
-    return np.clip(1.0 / (1.0 + kth_distance / scale), 0.0, 1.0)
+    return components.compute_coherence(
+        embeddings, method="density", neighbour_count=neighbour_count
+    ).coherence
 
 
 def compute_proposal_scores(
@@ -215,34 +261,18 @@ def compute_proposal_scores(
     coherence: ArrayLike,
     weights: AcquisitionWeights,
 ) -> FloatArray:
-    """Apply score = alpha*u + beta*n + gamma*r*coherence**p."""
+    """Apply score = alpha*u + beta*n + gamma*r*coherence**p (version 1)."""
 
-    u, n, r, c = (
-        _vector("uncertainty", uncertainty),
-        _vector("novelty", novelty),
-        _vector("rarity", rarity),
-        _vector("coherence", coherence),
-    )
-    if not (u.shape == n.shape == r.shape == c.shape):
+    values = {
+        "uncertainty": _vector("uncertainty", uncertainty),
+        "novelty": _vector("novelty", novelty),
+        "rarity": _vector("rarity", rarity),
+        "coherence": _vector("coherence", coherence),
+    }
+    if len({array.shape for array in values.values()}) > 1:
         raise ValueError("All acquisition components must have equal shape.")
-    if strategy == "uncertainty":
-        return u
-    if strategy == "uncertainty_novelty":
-        denominator = weights.uncertainty + weights.novelty
-        if denominator == 0:
-            raise ValueError("Uncertainty or novelty weight must be positive.")
-        return (weights.uncertainty * u + weights.novelty * n) / denominator
-    if strategy == "rarity":
-        return r
-
-    gated_rarity = r * np.power(c, weights.coherence_power)
-    if strategy == "rarity_coherence":
-        return gated_rarity
-    if strategy == "ungated_full":
-        return weights.uncertainty * u + weights.novelty * n + weights.rarity * r
-    if strategy == "full":
-        return weights.uncertainty * u + weights.novelty * n + weights.rarity * gated_rarity
-    raise ValueError(f"Unknown strategy: {strategy}")
+    values["gated"] = values["rarity"] * np.power(values["coherence"], weights.coherence_power)
+    return combine_components(_legacy_spec(strategy, weights), values)
 
 
 def score_proposals(
@@ -260,12 +290,10 @@ def score_proposals(
     seed: int,
     weights: AcquisitionWeights,
 ) -> AcquisitionResult:
-    """Run the complete proposal-scoring pipeline."""
+    """Run the complete version-1 proposal-scoring pipeline."""
 
     uncertainty = compute_uncertainty(
-        confidence=confidence,
-        posterior=posterior,
-        mode=uncertainty_mode,
+        confidence=confidence, posterior=posterior, mode=uncertainty_mode
     )
     novelty = compute_novelty(embeddings, reference_embeddings)
     pseudo_labels = assign_pseudo_labels(
@@ -294,16 +322,16 @@ def aggregate_image_scores(
     *,
     top_k: int = 3,
 ) -> dict[Hashable, float]:
-    """Average the top-k proposal scores of each image."""
+    """Average the top-k proposal scores of each image, in first-appearance order."""
 
     ids = np.asarray(image_ids, dtype=object)
     scores = _vector("proposal_scores", proposal_scores)
     if ids.ndim != 1 or ids.shape[0] != scores.shape[0] or top_k < 1:
         raise ValueError("Invalid image aggregation inputs.")
-    result: dict[Hashable, float] = {}
-    for image_id in dict.fromkeys(ids.tolist()):
-        result[image_id] = float(np.sort(scores[ids == image_id])[-top_k:].mean())
-    return result
+    canonical = _canonical_aggregate(ids, scores, method="top_k_mean", top_k=top_k)
+    # The pre-audit function returned first-appearance order; preserved because
+    # callers iterate the mapping directly.
+    return {image_id: canonical[str(image_id)] for image_id in dict.fromkeys(ids.tolist())}
 
 
 def select_images(
@@ -329,19 +357,36 @@ def _offline_strategy_scores(
     result: AcquisitionResult,
     weights: AcquisitionWeights,
 ) -> FloatArray:
-    if strategy == "uncertainty":
-        return result.uncertainty
-    if strategy == "uncertainty_novelty":
-        return weights.uncertainty * result.uncertainty + weights.novelty * result.novelty
-    if strategy == "rarity_no_coherence":
-        return (
-            weights.uncertainty * result.uncertainty
-            + weights.novelty * result.novelty
-            + weights.rarity * result.rarity
-        )
-    if strategy == "full":
-        return result.scores
-    raise ValueError(f"Unknown acquisition strategy: {strategy}")
+    """Offline strategy formulas, including the historical un-normalised form.
+
+    ``uncertainty_novelty`` here is ``alpha*u + beta*n`` with no division by
+    ``alpha + beta``, unlike :func:`compute_proposal_scores`. That divergence is
+    the pre-audit behaviour and is preserved so published offline comparisons
+    remain reproducible.
+    """
+
+    if strategy not in (
+        "uncertainty",
+        "uncertainty_novelty",
+        "rarity_no_coherence",
+        "full",
+    ):
+        raise ValueError(f"Unknown acquisition strategy: {strategy}")
+    spec = _legacy_spec(
+        strategy,
+        weights,
+        weight_normalise_uncertainty_novelty=False,
+    )
+    return combine_components(
+        spec,
+        {
+            "uncertainty": result.uncertainty,
+            "novelty": result.novelty,
+            "rarity": result.rarity,
+            "coherence": result.coherence,
+            "gated": result.rarity * np.power(result.coherence, weights.coherence_power),
+        },
+    )
 
 
 def _top_k_indices(
@@ -371,7 +416,11 @@ def compare_acquisition_strategies(
     acquisition_config: object,
     output_dir: str | Path | None = None,
 ) -> dict[str, object]:
-    """Compare offline acquisition strategies from exported proposal NPZ files."""
+    """Compare version-1 offline acquisition strategies from proposal NPZ files.
+
+    Superseded by :mod:`daowod.offline`, which supports every registry strategy
+    and multiple seeds. Retained because published pilot comparisons used it.
+    """
 
     allowed = {
         "random",
@@ -404,21 +453,33 @@ def compare_acquisition_strategies(
     if budget > len(unique_image_ids):
         raise ValueError("budget must not exceed candidate image count.")
 
-    weights = getattr(acquisition_config, "weights", AcquisitionWeights())
+    weights = getattr(acquisition_config, "weights", None) or AcquisitionWeights()
     if not isinstance(weights, AcquisitionWeights):
         raise ValueError("acquisition_config.weights must be an AcquisitionWeights instance.")
-    top_k = int(getattr(acquisition_config, "top_k", 3))
+
+    # A configuration field left unset must fall back to the version-1 default,
+    # never be stringified into "None".
+    def setting(name: str, default: object) -> object:
+        value = getattr(acquisition_config, name, None)
+        return default if value is None else value
+
+    top_k = int(setting("top_k", 3))
+    uncertainty_mode = str(setting("uncertainty_mode", "ambiguity"))
+    pseudo_label_source = str(setting("pseudo_label_source", "cluster"))
+    cluster_count = int(setting("cluster_count", 20))
+    neighbour_count = int(setting("neighbour_count", 5))
+
     base = score_proposals(
         strategy="full",
-        uncertainty_mode=str(getattr(acquisition_config, "uncertainty_mode", "ambiguity")),
-        pseudo_label_source=str(getattr(acquisition_config, "pseudo_label_source", "cluster")),
+        uncertainty_mode=uncertainty_mode,  # type: ignore[arg-type]
+        pseudo_label_source=pseudo_label_source,  # type: ignore[arg-type]
         confidence=candidates.confidence,
         posterior=candidates.posterior,
         embeddings=candidates.embeddings,
         reference_embeddings=references.embeddings,
         predicted_labels=candidates.predicted_labels,
-        cluster_count=int(getattr(acquisition_config, "cluster_count", 20)),
-        neighbour_count=int(getattr(acquisition_config, "neighbour_count", 5)),
+        cluster_count=cluster_count,
+        neighbour_count=neighbour_count,
         seed=seed,
         weights=weights,
     )
@@ -538,3 +599,22 @@ def compare_acquisition_strategies(
         "selected_ids": selected_ids,
         "overlap_matrix": overlap_matrix,
     }
+
+
+__all__ = [
+    "AcquisitionResult",
+    "AcquisitionWeights",
+    "PseudoLabelSource",
+    "Strategy",
+    "UncertaintyMode",
+    "aggregate_image_scores",
+    "assign_pseudo_labels",
+    "compare_acquisition_strategies",
+    "compute_coherence",
+    "compute_novelty",
+    "compute_proposal_scores",
+    "compute_rarity",
+    "compute_uncertainty",
+    "score_proposals",
+    "select_images",
+]

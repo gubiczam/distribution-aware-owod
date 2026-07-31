@@ -578,6 +578,41 @@ class ScoringResult:
         return mask
 
 
+def combine_components(
+    spec: StrategySpec, components_by_name: Mapping[str, ArrayLike]
+) -> FloatArray:
+    """The weighted sum. The only place a strategy's arithmetic happens.
+
+    ``score_pool`` and the legacy compatibility shim in
+    :mod:`daowod.acquisition` both route through here, so no second copy of the
+    formula can drift away from this one.
+    """
+
+    weights = spec.weights()
+    arrays = {
+        name: np.asarray(components_by_name[name], dtype=np.float64)
+        for name in weights
+        if name in components_by_name
+    }
+    missing = [name for name, weight in weights.items() if weight > 0 and name not in arrays]
+    if missing:
+        raise StrategyError(f"{spec.name}: missing weighted components {missing}.")
+    lengths = {array.shape for array in arrays.values()}
+    if len(lengths) > 1:
+        raise ValueError("All acquisition components must have equal shape.")
+    size = next(iter(lengths))[0] if lengths else 0
+    scores = np.zeros(size, dtype=np.float64)
+    for name, weight in weights.items():
+        if weight > 0:
+            scores = scores + weight * arrays[name]
+    if spec.weight_normalise:
+        total = sum(value for value in weights.values() if value > 0)
+        if total <= 0:
+            raise StrategyError(f"{spec.name}: cannot weight-normalise zero weights.")
+        scores = scores / total
+    return scores
+
+
 def aggregate_image_scores(
     image_ids: ArrayLike,
     proposal_scores: ArrayLike,
@@ -746,15 +781,7 @@ def score_pool(
     raw["gated"] = gated_raw
     normalised["gated"] = normalise(gated_raw, spec.normalisation_for("gated"))
 
-    scores = np.zeros(count, dtype=np.float64)
-    for name, weight in weights.items():
-        if weight > 0:
-            scores = scores + weight * normalised[name]
-    if spec.weight_normalise:
-        total = sum(value for value in weights.values() if value > 0)
-        if total <= 0:
-            raise StrategyError(f"{spec.name}: cannot weight-normalise zero weights.")
-        scores = scores / total
+    scores = combine_components(spec, normalised)
 
     image_scores = aggregate_image_scores(
         ids, scores, method=spec.image_aggregation, top_k=spec.top_k

@@ -24,6 +24,9 @@ dev = [
     "ruff>=0.15,<1",
 ]
 
+[project.scripts]
+daowod-run = "daowod.cli:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["daowod*"]
