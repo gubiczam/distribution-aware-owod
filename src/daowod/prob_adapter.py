@@ -52,10 +52,7 @@ class ProposalBatch:
         if self.posterior is not None and self.posterior.shape[0] != count:
             raise ValueError("posterior must match proposal count.")
 
-        if (
-            self.predicted_labels is not None
-            and self.predicted_labels.shape != (count,)
-        ):
+        if self.predicted_labels is not None and self.predicted_labels.shape != (count,):
             raise ValueError("predicted_labels must match proposal count.")
 
         if self.boxes is not None and self.boxes.shape != (count, 4):
@@ -72,9 +69,7 @@ class ProposalBatch:
             missing = {"image_ids", "confidence", "embeddings"} - set(data.files)
 
             if missing:
-                raise ValueError(
-                    f"Missing proposal NPZ fields: {sorted(missing)}"
-                )
+                raise ValueError(f"Missing proposal NPZ fields: {sorted(missing)}")
 
             return cls(
                 image_ids=np.asarray(data["image_ids"], dtype=object),
@@ -87,20 +82,14 @@ class ProposalBatch:
                     dtype=np.float64,
                 ),
                 posterior=(
-                    np.asarray(data["posterior"], dtype=np.float64)
-                    if "posterior" in data
-                    else None
+                    np.asarray(data["posterior"], dtype=np.float64) if "posterior" in data else None
                 ),
                 predicted_labels=(
                     np.asarray(data["predicted_labels"], dtype=np.int64)
                     if "predicted_labels" in data
                     else None
                 ),
-                boxes=(
-                    np.asarray(data["boxes"], dtype=np.float64)
-                    if "boxes" in data
-                    else None
-                ),
+                boxes=(np.asarray(data["boxes"], dtype=np.float64) if "boxes" in data else None),
                 objectness=(
                     np.asarray(data["objectness"], dtype=np.float64)
                     if "objectness" in data
@@ -128,9 +117,7 @@ class ProbAdapter:
         self.timeout_seconds = timeout_seconds
 
         if not self.repository_path.exists():
-            raise FileNotFoundError(
-                f"PROB repository not found: {self.repository_path}"
-            )
+            raise FileNotFoundError(f"PROB repository not found: {self.repository_path}")
 
     @staticmethod
     def _write_ids(
@@ -149,10 +136,7 @@ class ProbAdapter:
     ) -> None:
         command = template.format(
             repo=str(self.repository_path),
-            **{
-                key: str(value)
-                for key, value in values.items()
-            },
+            **{key: str(value) for key, value in values.items()},
         )
 
         print("=" * 80)
@@ -218,9 +202,7 @@ class ProbAdapter:
         )
 
         if not checkpoint_path.exists():
-            raise FileNotFoundError(
-                f"PROB did not create checkpoint: {checkpoint_path}"
-            )
+            raise FileNotFoundError(f"PROB did not create checkpoint: {checkpoint_path}")
 
         return checkpoint_path
 
@@ -255,9 +237,7 @@ class ProbAdapter:
         )
 
         if not output.exists():
-            raise FileNotFoundError(
-                f"PROB did not create proposals: {output}"
-            )
+            raise FileNotFoundError(f"PROB did not create proposals: {output}")
 
         proposals = ProposalBatch.load(output)
 
@@ -287,13 +267,9 @@ class ProbAdapter:
         )
 
         if not output.exists():
-            raise FileNotFoundError(
-                f"PROB did not create metrics: {output}"
-            )
+            raise FileNotFoundError(f"PROB did not create metrics: {output}")
 
-        metrics = json.loads(
-            output.read_text(encoding="utf-8")
-        )
+        metrics = json.loads(output.read_text(encoding="utf-8"))
 
         required = {
             "known_mAP",
@@ -305,8 +281,6 @@ class ProbAdapter:
         missing = required - set(metrics)
 
         if missing:
-            raise ValueError(
-                f"Missing PROB metrics: {sorted(missing)}"
-            )
+            raise ValueError(f"Missing PROB metrics: {sorted(missing)}")
 
         return metrics
