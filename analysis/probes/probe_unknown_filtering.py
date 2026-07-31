@@ -103,7 +103,7 @@ print("How much of the pool would the filter discard, and does it keep the tail?
 print("=" * 88)
 kept = Counter()
 total = Counter()
-for cls, keep in zip(pool.true_proposal_class.tolist(), unknown_mask.tolist()):
+for cls, keep in zip(pool.true_proposal_class.tolist(), unknown_mask.tolist(), strict=True):
     total[cls] += 1
     if keep:
         kept[cls] += 1
