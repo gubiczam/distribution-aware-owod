@@ -54,12 +54,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--candidate-ids",
         type=Path,
-        default=Path("outputs/stage1b/stage1b_candidate_500.txt"),
+        default=Path("data/protocol/stage1b/stage1b_candidate_500.txt"),
     )
     parser.add_argument(
         "--reference-ids",
         type=Path,
-        default=Path("outputs/stage1b/stage1b_reference_3500.txt"),
+        default=Path("data/protocol/stage1b/stage1b_reference_3500.txt"),
     )
     parser.add_argument(
         "--annotations-dir",

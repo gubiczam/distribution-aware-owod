@@ -16,8 +16,8 @@ protocol:
   num_classes: 81
   objectness_temperature: 1
   train_split: runtime_selected_ids
-  candidate_pool_split: outputs/stage1b/stage1b_candidate_500.txt
-  reference_split: outputs/stage1b/stage1b_reference_3500.txt
+  candidate_pool_split: data/protocol/stage1b/stage1b_candidate_500.txt
+  reference_split: data/protocol/stage1b/stage1b_reference_3500.txt
   evaluation_split: owdetr_test
   evaluation_split_sha256: f58a4a97a8c4c84af337e6ab8dfb4ec97b5d96c6269a601d4f3d4dc3bddef49d
   initial_labelled_split: null
@@ -57,7 +57,7 @@ acquisition:
   minimum_cluster_size: 3
 
 dataset:
-  image_set_path: outputs/stage1b/stage1b_candidate_500.txt
+  image_set_path: data/protocol/stage1b/stage1b_candidate_500.txt
   annotations_dir: /Users/gubiczam/owod_stage/Annotations
   unknown_classes:
     - traffic light

@@ -10,6 +10,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import yaml
 
 from daowod.acquisition import (
     AcquisitionWeights,
@@ -30,6 +31,12 @@ from daowod.experiment import run_active_round
 from daowod.metrics import Detection, GroundTruth, grouped_unknown_recall
 from daowod.prob_adapter import ProposalBatch
 from daowod.scoring import STRATEGY_REGISTRY, StrategySpec
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+STAGE1B_CANDIDATE_SPLIT = Path("data/protocol/stage1b/stage1b_candidate_500.txt")
+STAGE1B_REFERENCE_SPLIT = Path("data/protocol/stage1b/stage1b_reference_3500.txt")
+STAGE1B_CANDIDATE_SHA256 = "70fa185514dcbbba8397781d85275362c888e6ea0c4d6c1325ad6c82fa18aac6"
+STAGE1B_REFERENCE_SHA256 = "25a1b33614bcb77c8ef9b238ab878950b62861d0fc048fc58574c7fd0c6df762"
 
 
 def _write_voc_xml(path: Path, class_names: list[str]) -> None:
@@ -555,6 +562,26 @@ def test_protocol_command_parity_accepts_explicit_owdetr_sowodb_config(tmp_path:
     assert config.protocol is not None
     assert config.protocol.dataset_protocol == "OWDETR"
     assert config.as_dict()["command_parity"]["status"] == "ok"
+
+
+def test_stage2_configs_use_version_controlled_stage1b_splits() -> None:
+    candidate = REPO_ROOT / STAGE1B_CANDIDATE_SPLIT
+    reference = REPO_ROOT / STAGE1B_REFERENCE_SPLIT
+    assert file_sha256(candidate) == STAGE1B_CANDIDATE_SHA256
+    assert file_sha256(reference) == STAGE1B_REFERENCE_SHA256
+
+    config_paths = [
+        REPO_ROOT / "configs/smoke_stage2_t4.yaml",
+        REPO_ROOT / "configs/stage2_v2_random.yaml",
+        REPO_ROOT / "configs/stage2_v2_uncertainty_objectness_weighted_entropy.yaml",
+        REPO_ROOT / "configs/stage2_v2_full.yaml",
+        REPO_ROOT / "configs/stage2_v2_full_no_novelty.yaml",
+    ]
+    for path in config_paths:
+        config = yaml.safe_load(path.read_text(encoding="utf-8"))
+        assert Path(config["protocol"]["candidate_pool_split"]) == STAGE1B_CANDIDATE_SPLIT
+        assert Path(config["protocol"]["reference_split"]) == STAGE1B_REFERENCE_SPLIT
+        assert Path(config["dataset"]["image_set_path"]) == STAGE1B_CANDIDATE_SPLIT
 
 
 def test_protocol_command_parity_rejects_towod_leaking_into_one_stage(tmp_path: Path) -> None:

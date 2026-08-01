@@ -12,7 +12,11 @@ env/
 .env
 .env.*
 !.env.example
-data/
+data/*
+!data/protocol/
+data/protocol/*
+!data/protocol/stage1b/
+!data/protocol/stage1b/*.txt
 outputs/
 checkpoints/
 runs/

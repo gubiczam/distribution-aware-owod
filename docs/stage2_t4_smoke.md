@@ -65,8 +65,8 @@ set -euo pipefail
 cd /content/drive/MyDrive/distribution-aware-owod
 test -d /content/drive/MyDrive/owod_stage
 test -d /content/drive/MyDrive/results/SOWODB
-test -f outputs/stage1b/stage1b_candidate_500.txt
-test -f outputs/stage1b/stage1b_reference_3500.txt
+test -f data/protocol/stage1b/stage1b_candidate_500.txt
+test -f data/protocol/stage1b/stage1b_reference_3500.txt
 test -f /Users/gubiczam/owod_stage/ImageSets/OWDETR/owdetr_test.txt
 test -d /Users/gubiczam/owod_stage/Annotations
 test -f /Users/gubiczam/Downloads/results/SOWODB/t1.pth

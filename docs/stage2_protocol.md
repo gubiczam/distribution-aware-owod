@@ -23,8 +23,8 @@
 ## Pool Decision
 
 - Decision: Option A.
-- Candidate pool: leak-free Stage 1B candidate split, `outputs/stage1b/stage1b_candidate_500.txt`.
-- Representation reference bank: leak-free Stage 1B fixed bank, `outputs/stage1b/stage1b_reference_3500.txt`.
+- Candidate pool: leak-free Stage 1B candidate split, `data/protocol/stage1b/stage1b_candidate_500.txt`.
+- Representation reference bank: leak-free Stage 1B fixed bank, `data/protocol/stage1b/stage1b_reference_3500.txt`.
 - Long-tail transformation: disabled. `dataset.long_tail.enabled=false` and `protocol.long_tail_transformation=none` preserve real Stage 1B comparability.
 - Initial labelled split: none. Stage 2 starts with zero labelled candidate-pool images so first-round acquisition sees the exact Stage 1B candidate pool.
 - Evaluation split: fixed `owdetr_test`, SHA256 `f58a4a97a8c4c84af337e6ab8dfb4ec97b5d96c6269a601d4f3d4dc3bddef49d`.
