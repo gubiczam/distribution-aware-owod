@@ -31,7 +31,7 @@ class DatasetState:
         unique_ids = list(dict.fromkeys(str(image_id) for image_id in image_ids))
         if len(unique_ids) != len(image_ids):
             raise ValueError("image_ids must not contain duplicates.")
-        if initial_images < 1 or initial_images > len(unique_ids):
+        if initial_images < 0 or initial_images > len(unique_ids):
             raise ValueError("Invalid initial_images value.")
 
         rng = np.random.default_rng(seed)

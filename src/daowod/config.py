@@ -9,6 +9,7 @@ disagree about what a strategy means.
 
 import hashlib
 import json
+import shlex
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,6 +18,8 @@ from typing import Any
 import yaml
 
 from daowod.acquisition import AcquisitionWeights
+from daowod.dataset import file_sha256, read_image_ids, read_voc_classes
+from daowod.groups import ClassGroups
 from daowod.scoring import (
     IMAGE_AGGREGATIONS,
     STRATEGY_REGISTRY,
@@ -27,6 +30,376 @@ from daowod.scoring import (
 
 class ConfigError(ValueError):
     """Raised for a malformed or self-inconsistent experiment configuration."""
+
+
+def _flag_values(command: str) -> dict[str, str | bool]:
+    try:
+        tokens = shlex.split(command)
+    except ValueError as error:
+        raise ConfigError(f"Command cannot be parsed with shlex: {command!r}") from error
+    values: dict[str, str | bool] = {}
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if not token.startswith("--"):
+            index += 1
+            continue
+        if "=" in token:
+            key, value = token.split("=", 1)
+            values[key] = value
+            index += 1
+            continue
+        if index + 1 < len(tokens) and not tokens[index + 1].startswith("--"):
+            values[token] = tokens[index + 1]
+            index += 2
+        else:
+            values[token] = True
+            index += 1
+    return values
+
+
+@dataclass(frozen=True)
+class ProtocolConfig:
+    """The one task/protocol object that every stage must agree with."""
+
+    dataset_protocol: str
+    data_root: str
+    previous_introduced_classes: int
+    current_introduced_classes: int
+    num_classes: int
+    objectness_temperature: float
+    candidate_pool_split: str
+    reference_split: str
+    evaluation_split: str
+    evaluation_split_sha256: str
+    initial_labelled_split: str | None
+    checkpoint: str
+    checkpoint_sha256: str
+    image_aggregation: str
+    top_k: int
+    uncertainty_method: str
+    clustering_method: str
+    acquisition_budget: int
+    active_learning_rounds: int
+    training_schedule: str
+    evaluation_settings: str
+    pool_policy: str = "stage1_exact"
+    reference_policy: str = "fixed_stage1_representation_bank"
+    long_tail_transformation: str = "none"
+    train_split: str = "runtime_selected_ids"
+    class_group_mapping: str = "stage1_candidate_frequency_thirds"
+    clustering_seed_policy: str = "derive_seed('pool', model_seed, round_index)"
+    cuda_determinism: str = "recorded_not_forced"
+    allow_candidate_evaluation_overlap: bool = False
+    allow_labelled_evaluation_overlap: bool = False
+
+    def __post_init__(self) -> None:
+        if self.dataset_protocol not in {"OWDETR", "TOWOD", "VOC2007"}:
+            raise ConfigError(f"Unknown dataset_protocol: {self.dataset_protocol!r}")
+        if self.previous_introduced_classes < 0 or self.current_introduced_classes < 1:
+            raise ConfigError("Introduced class counts must be non-negative/positive.")
+        if self.num_classes < self.current_introduced_classes:
+            raise ConfigError("num_classes must cover the introduced classes.")
+        if self.objectness_temperature <= 0:
+            raise ConfigError("objectness_temperature must be positive.")
+        if self.top_k < 1:
+            raise ConfigError("protocol.top_k must be positive.")
+        if self.acquisition_budget < 1 or self.active_learning_rounds < 1:
+            raise ConfigError("protocol acquisition budget and rounds must be positive.")
+        required_paths = {
+            "data_root": self.data_root,
+            "candidate_pool_split": self.candidate_pool_split,
+            "reference_split": self.reference_split,
+            "checkpoint": self.checkpoint,
+        }
+        for name, value in required_paths.items():
+            if not value:
+                raise ConfigError(f"protocol.{name} is required.")
+        if not self.evaluation_split:
+            raise ConfigError("protocol.evaluation_split is required.")
+        if not self.evaluation_split_sha256:
+            raise ConfigError("protocol.evaluation_split_sha256 is required.")
+        for name, value in (
+            ("image_aggregation", self.image_aggregation),
+            ("uncertainty_method", self.uncertainty_method),
+            ("clustering_method", self.clustering_method),
+            ("training_schedule", self.training_schedule),
+            ("evaluation_settings", self.evaluation_settings),
+        ):
+            if not value:
+                raise ConfigError(f"protocol.{name} is required.")
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "dataset_protocol": self.dataset_protocol,
+            "data_root": self.data_root,
+            "previous_introduced_classes": self.previous_introduced_classes,
+            "current_introduced_classes": self.current_introduced_classes,
+            "num_classes": self.num_classes,
+            "objectness_temperature": self.objectness_temperature,
+            "train_split": self.train_split,
+            "candidate_pool_split": self.candidate_pool_split,
+            "reference_split": self.reference_split,
+            "evaluation_split": self.evaluation_split,
+            "evaluation_split_sha256": self.evaluation_split_sha256,
+            "initial_labelled_split": self.initial_labelled_split,
+            "checkpoint": self.checkpoint,
+            "checkpoint_sha256": self.checkpoint_sha256,
+            "image_aggregation": self.image_aggregation,
+            "top_k": self.top_k,
+            "uncertainty_method": self.uncertainty_method,
+            "clustering_method": self.clustering_method,
+            "acquisition_budget": self.acquisition_budget,
+            "active_learning_rounds": self.active_learning_rounds,
+            "training_schedule": self.training_schedule,
+            "evaluation_settings": self.evaluation_settings,
+            "pool_policy": self.pool_policy,
+            "reference_policy": self.reference_policy,
+            "long_tail_transformation": self.long_tail_transformation,
+            "class_group_mapping": self.class_group_mapping,
+            "clustering_seed_policy": self.clustering_seed_policy,
+            "cuda_determinism": self.cuda_determinism,
+            "allow_candidate_evaluation_overlap": self.allow_candidate_evaluation_overlap,
+            "allow_labelled_evaluation_overlap": self.allow_labelled_evaluation_overlap,
+        }
+
+
+def validate_command_parity(protocol: ProtocolConfig, prob: "ProbConfig") -> dict[str, object]:
+    """Fail if train/predict/evaluate would run different OWOD task settings."""
+
+    commands = {
+        "train": prob.train_command,
+        "predict": prob.predict_command,
+        "evaluate": prob.evaluate_command,
+    }
+    parsed = {stage: _flag_values(command) for stage, command in commands.items()}
+    expected_common = {
+        "--data-root": protocol.data_root,
+        "--dataset": protocol.dataset_protocol,
+        "--prev-introduced-classes": str(protocol.previous_introduced_classes),
+        "--current-introduced-classes": str(protocol.current_introduced_classes),
+        "--num-classes": str(protocol.num_classes),
+        "--objectness-temperature": f"{protocol.objectness_temperature:g}",
+    }
+    required_placeholders = {
+        "train": {
+            "--labelled-ids": "{labelled_ids}",
+            "--previous-checkpoint": "{previous_checkpoint}",
+            "--output-checkpoint": "{checkpoint}",
+            "--output-dir": "{output_dir}",
+        },
+        "predict": {
+            "--image-ids": "{image_ids}",
+            "--checkpoint": "{checkpoint}",
+            "--output": "{proposals}",
+        },
+        "evaluate": {
+            "--checkpoint": "{checkpoint}",
+            "--output": "{metrics}",
+            "--output-dir": "{output_dir}",
+            "--test-set": protocol.evaluation_split,
+        },
+    }
+    errors: list[str] = []
+    for stage, flags in parsed.items():
+        for key, expected in expected_common.items():
+            observed = flags.get(key)
+            if observed is None:
+                errors.append(f"{stage}: missing {key}={expected!r}")
+            elif str(observed) != expected:
+                errors.append(f"{stage}: {key}={observed!r} != protocol {expected!r}")
+        for key, expected in required_placeholders[stage].items():
+            observed = flags.get(key)
+            if observed is None:
+                errors.append(f"{stage}: missing required argument {key}")
+            elif str(observed) != expected:
+                errors.append(f"{stage}: {key}={observed!r} != expected {expected!r}")
+    if errors:
+        raise ConfigError("Command/protocol parity failed:\n- " + "\n- ".join(errors))
+    return {
+        "status": "ok",
+        "commands": commands,
+        "parsed_flags": parsed,
+        "protocol": protocol.as_dict(),
+    }
+
+
+def validate_resolved_command_parity(
+    protocol: ProtocolConfig, commands: Mapping[str, str]
+) -> dict[str, object]:
+    """Validate the concrete train/predict/evaluate commands for a round."""
+
+    expected_common = {
+        "--data-root": protocol.data_root,
+        "--dataset": protocol.dataset_protocol,
+        "--prev-introduced-classes": str(protocol.previous_introduced_classes),
+        "--current-introduced-classes": str(protocol.current_introduced_classes),
+        "--num-classes": str(protocol.num_classes),
+        "--objectness-temperature": f"{protocol.objectness_temperature:g}",
+    }
+    required_args = {
+        "train": ("--labelled-ids", "--previous-checkpoint", "--output-checkpoint", "--output-dir"),
+        "candidate_predict": ("--image-ids", "--checkpoint", "--output"),
+        "reference_predict": ("--image-ids", "--checkpoint", "--output"),
+        "evaluate": ("--checkpoint", "--output", "--output-dir", "--test-set"),
+    }
+    parsed = {stage: _flag_values(command) for stage, command in commands.items()}
+    errors: list[str] = []
+    for stage, command in commands.items():
+        if "{" in command or "}" in command:
+            errors.append(f"{stage}: unresolved placeholder remains in command")
+    for stage, keys in required_args.items():
+        flags = parsed.get(stage)
+        if flags is None:
+            errors.append(f"missing resolved {stage} command")
+            continue
+        for key, expected in expected_common.items():
+            observed = flags.get(key)
+            if observed is None:
+                errors.append(f"{stage}: missing {key}={expected!r}")
+            elif str(observed) != expected:
+                errors.append(f"{stage}: {key}={observed!r} != protocol {expected!r}")
+        for key in keys:
+            observed = flags.get(key)
+            if observed in (None, ""):
+                errors.append(f"{stage}: missing resolved argument {key}")
+        if stage == "evaluate" and str(flags.get("--test-set")) != protocol.evaluation_split:
+            errors.append(
+                f"{stage}: --test-set={flags.get('--test-set')!r} "
+                f"!= protocol {protocol.evaluation_split!r}"
+            )
+    if errors:
+        raise ConfigError("Resolved command/protocol parity failed:\n- " + "\n- ".join(errors))
+    return {"status": "ok", "parsed_flags": parsed}
+
+
+CLASS_ALIASES = {
+    "airplane": "aeroplane",
+    "motorcycle": "motorbike",
+    "couch": "sofa",
+    "dining table": "diningtable",
+    "potted plant": "pottedplant",
+    "tv": "tvmonitor",
+}
+
+
+def _image_exists(directory: str | Path, image_id: str) -> bool:
+    root = Path(directory)
+    return any((root / f"{image_id}{suffix}").exists() for suffix in (".jpg", ".jpeg", ".png"))
+
+
+def validate_evaluation_assets(
+    protocol: ProtocolConfig,
+    dataset: "DatasetConfig",
+    evaluation: "EvaluationConfig",
+) -> dict[str, Any]:
+    """Validate the frozen evaluation split before any campaign can run."""
+
+    split_path = (
+        Path(protocol.data_root)
+        / "ImageSets"
+        / protocol.dataset_protocol
+        / f"{protocol.evaluation_split}.txt"
+    )
+    if not split_path.exists():
+        raise ConfigError(f"Missing evaluation split: {split_path}")
+    observed_digest = file_sha256(split_path)
+    if observed_digest != protocol.evaluation_split_sha256:
+        raise ConfigError(
+            "Evaluation split digest mismatch: "
+            f"{observed_digest} != protocol {protocol.evaluation_split_sha256}"
+        )
+
+    evaluation_ids = read_image_ids(split_path)
+    candidate_ids = read_image_ids(protocol.candidate_pool_split)
+    reference_ids = read_image_ids(protocol.reference_split)
+    labelled_ids = (
+        read_image_ids(protocol.initial_labelled_split) if protocol.initial_labelled_split else []
+    )
+    annotations_dir = Path(dataset.annotations_dir)
+    images_dir = Path(protocol.data_root) / "JPEGImages"
+    missing_annotations = [
+        image_id
+        for image_id in evaluation_ids
+        if not (annotations_dir / f"{image_id}.xml").exists()
+    ]
+    missing_images = [
+        image_id for image_id in evaluation_ids if not _image_exists(images_dir, image_id)
+    ]
+    if missing_annotations:
+        raise ConfigError(
+            f"Evaluation split has {len(missing_annotations)} missing annotation(s): "
+            f"{missing_annotations[:20]}"
+        )
+    if missing_images:
+        raise ConfigError(
+            f"Evaluation split has {len(missing_images)} missing image(s): {missing_images[:20]}"
+        )
+
+    candidate_overlap = sorted(set(candidate_ids) & set(evaluation_ids))
+    labelled_overlap = sorted(set(labelled_ids) & set(evaluation_ids))
+    reference_overlap = sorted(set(reference_ids) & set(evaluation_ids))
+    if candidate_overlap and not protocol.allow_candidate_evaluation_overlap:
+        raise ConfigError(
+            "Evaluation split overlaps the acquisition candidate pool: "
+            f"{len(candidate_overlap)} image(s), first IDs {candidate_overlap[:20]}"
+        )
+    if labelled_overlap and not protocol.allow_labelled_evaluation_overlap:
+        raise ConfigError(
+            "Evaluation split overlaps the initial labelled training split: "
+            f"{len(labelled_overlap)} image(s), first IDs {labelled_overlap[:20]}"
+        )
+
+    known_classes = set(dataset.known_classes)
+    unknown_classes = set(dataset.unknown_classes)
+    groups = (
+        ClassGroups.from_class_stats_csv(dataset.class_groups_path)
+        if dataset.class_groups_path
+        else None
+    )
+    support: dict[str, Any] = {
+        "image_count": len(evaluation_ids),
+        "known_objects": 0,
+        "unknown_objects": 0,
+        "head_objects": 0,
+        "medium_objects": 0,
+        "tail_objects": 0,
+    }
+    for image_id in evaluation_ids:
+        for raw_name in read_voc_classes(image_id, annotations_dir):
+            class_name = CLASS_ALIASES.get(raw_name, raw_name)
+            if class_name in known_classes:
+                support["known_objects"] += 1
+            if class_name in unknown_classes:
+                support["unknown_objects"] += 1
+                if groups is not None:
+                    group = groups.groups.get(class_name)
+                    if group in ("head", "medium", "tail"):
+                        support[f"{group}_objects"] += 1
+
+    if support["known_objects"] == 0 or support["unknown_objects"] == 0:
+        raise ConfigError(f"Evaluation split has invalid known/unknown support: {support}")
+    if evaluation.grouped_metrics and groups is not None:
+        missing_groups = [
+            group for group in ("head", "medium", "tail") if support[f"{group}_objects"] == 0
+        ]
+        if missing_groups:
+            raise ConfigError(
+                f"Evaluation split has zero support for grouped metric(s): {missing_groups}"
+            )
+    return {
+        "status": "ok",
+        "split_path": str(split_path),
+        "split_sha256": observed_digest,
+        "image_count": len(evaluation_ids),
+        "candidate_evaluation_overlap_count": len(candidate_overlap),
+        "candidate_evaluation_overlap_first20": candidate_overlap[:20],
+        "reference_evaluation_overlap_count": len(reference_overlap),
+        "reference_evaluation_overlap_first20": reference_overlap[:20],
+        "labelled_evaluation_overlap_count": len(labelled_overlap),
+        "labelled_evaluation_overlap_first20": labelled_overlap[:20],
+        "support": support,
+    }
 
 
 @dataclass(frozen=True)
@@ -42,8 +415,8 @@ class ActiveLearningConfig:
     def __post_init__(self) -> None:
         if self.rounds < 1:
             raise ConfigError("rounds must be positive.")
-        if min(self.budget, self.initial_images, self.budget_per_round) < 1:
-            raise ConfigError("Active-learning values must be positive.")
+        if self.initial_images < 0 or min(self.budget, self.budget_per_round) < 1:
+            raise ConfigError("Active-learning values must be non-negative/positive.")
         if not self.seeds:
             raise ConfigError("At least one seed is required.")
         if len(set(self.seeds)) != len(self.seeds):
@@ -191,6 +564,7 @@ class ProbConfig:
         if self.timeout_seconds < 1:
             raise ConfigError("timeout_seconds must be positive.")
         for name, template in (
+            ("train_command", self.train_command),
             ("predict_command", self.predict_command),
             ("evaluate_command", self.evaluate_command),
         ):
@@ -221,6 +595,7 @@ class ExperimentConfig:
     dataset: DatasetConfig
     prob: ProbConfig
     output_dir: str
+    protocol: ProtocolConfig | None = None
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
     source_path: str | None = None
     #: Provenance for deprecated YAML keys, e.g.
@@ -271,6 +646,15 @@ class ExperimentConfig:
                 "evaluate_command": self.prob.evaluate_command,
                 "timeout_seconds": self.prob.timeout_seconds,
             },
+            "protocol": self.protocol.as_dict() if self.protocol else None,
+            "command_parity": (
+                validate_command_parity(self.protocol, self.prob) if self.protocol else None
+            ),
+            "evaluation_preflight": (
+                validate_evaluation_assets(self.protocol, self.dataset, self.evaluation)
+                if self.protocol
+                else None
+            ),
             "evaluation": {
                 "grouped_metrics": self.evaluation.grouped_metrics,
                 "iou_threshold": self.evaluation.iou_threshold,
@@ -314,6 +698,7 @@ def load_config(path: str | Path) -> ExperimentConfig:
     dataset = _section(raw, "dataset")
     long_tail = _section(dataset, "long_tail", required=False)
     prob = _section(raw, "prob")
+    protocol_raw = _section(raw, "protocol", required=False)
     evaluation = _section(raw, "evaluation", required=False)
     weights_raw = acquisition.get("weights") or {}
 
@@ -357,6 +742,118 @@ def load_config(path: str | Path) -> ExperimentConfig:
         )
 
     try:
+        protocol = (
+            ProtocolConfig(
+                dataset_protocol=str(protocol_raw["dataset_protocol"]),
+                data_root=str(protocol_raw["data_root"]),
+                previous_introduced_classes=int(protocol_raw["previous_introduced_classes"]),
+                current_introduced_classes=int(protocol_raw["current_introduced_classes"]),
+                num_classes=int(protocol_raw["num_classes"]),
+                objectness_temperature=float(protocol_raw["objectness_temperature"]),
+                train_split=str(protocol_raw.get("train_split", "runtime_selected_ids")),
+                candidate_pool_split=str(protocol_raw["candidate_pool_split"]),
+                reference_split=str(protocol_raw["reference_split"]),
+                evaluation_split=str(protocol_raw["evaluation_split"]),
+                evaluation_split_sha256=str(protocol_raw["evaluation_split_sha256"]),
+                initial_labelled_split=(
+                    str(protocol_raw["initial_labelled_split"])
+                    if protocol_raw.get("initial_labelled_split") is not None
+                    else None
+                ),
+                checkpoint=str(protocol_raw["checkpoint"]),
+                checkpoint_sha256=str(protocol_raw["checkpoint_sha256"]),
+                image_aggregation=str(protocol_raw["image_aggregation"]),
+                top_k=int(protocol_raw["top_k"]),
+                uncertainty_method=str(protocol_raw["uncertainty_method"]),
+                clustering_method=str(protocol_raw["clustering_method"]),
+                acquisition_budget=int(protocol_raw["acquisition_budget"]),
+                active_learning_rounds=int(protocol_raw["active_learning_rounds"]),
+                training_schedule=str(protocol_raw["training_schedule"]),
+                evaluation_settings=str(protocol_raw["evaluation_settings"]),
+                pool_policy=str(protocol_raw.get("pool_policy", "stage1_exact")),
+                reference_policy=str(
+                    protocol_raw.get("reference_policy", "fixed_stage1_representation_bank")
+                ),
+                long_tail_transformation=str(protocol_raw.get("long_tail_transformation", "none")),
+                class_group_mapping=str(
+                    protocol_raw.get("class_group_mapping", "stage1_candidate_frequency_thirds")
+                ),
+                clustering_seed_policy=str(
+                    protocol_raw.get(
+                        "clustering_seed_policy", "derive_seed('pool', model_seed, round_index)"
+                    )
+                ),
+                cuda_determinism=str(protocol_raw.get("cuda_determinism", "recorded_not_forced")),
+                allow_candidate_evaluation_overlap=bool(
+                    protocol_raw.get("allow_candidate_evaluation_overlap", False)
+                ),
+                allow_labelled_evaluation_overlap=bool(
+                    protocol_raw.get("allow_labelled_evaluation_overlap", False)
+                ),
+            )
+            if protocol_raw
+            else None
+        )
+        prob_config = ProbConfig(
+            repository_path=str(prob["repository_path"]),
+            initial_checkpoint=prob.get("initial_checkpoint"),
+            train_command=str(prob["train_command"]),
+            predict_command=str(prob["predict_command"]),
+            evaluate_command=str(prob["evaluate_command"]),
+            timeout_seconds=int(prob.get("timeout_seconds", 86400)),
+        )
+        if protocol:
+            validate_command_parity(protocol, prob_config)
+            if (
+                prob_config.initial_checkpoint
+                and str(prob_config.initial_checkpoint) != protocol.checkpoint
+            ):
+                raise ConfigError("prob.initial_checkpoint must equal protocol.checkpoint.")
+            if dataset["image_set_path"] != protocol.candidate_pool_split:
+                raise ConfigError(
+                    "dataset.image_set_path must equal protocol.candidate_pool_split."
+                )
+            if long_tail.get("enabled", True) and protocol.long_tail_transformation == "none":
+                raise ConfigError(
+                    "dataset.long_tail.enabled must be false when protocol says none."
+                )
+            if int(active.get("rounds", 1)) != protocol.active_learning_rounds:
+                raise ConfigError(
+                    "active_learning.rounds must equal protocol.active_learning_rounds."
+                )
+            if int(active.get("budget_per_round", 10)) != protocol.acquisition_budget:
+                raise ConfigError(
+                    "active_learning.budget_per_round must equal protocol.acquisition_budget."
+                )
+            if (
+                str(acquisition.get("image_aggregation", "top_k_mean"))
+                != protocol.image_aggregation
+            ):
+                raise ConfigError(
+                    "acquisition.image_aggregation must equal protocol.image_aggregation."
+                )
+            if int(acquisition.get("top_k", 3)) != protocol.top_k:
+                raise ConfigError("acquisition.top_k must equal protocol.top_k.")
+        evaluation_config = EvaluationConfig(
+            grouped_metrics=bool(evaluation.get("grouped_metrics", True)),
+            iou_threshold=float(evaluation.get("iou_threshold", 0.5)),
+            unknown_prediction_name=str(evaluation.get("unknown_prediction_name", "unknown")),
+            require_detections=bool(evaluation.get("require_detections", True)),
+        )
+        dataset_config = DatasetConfig(
+            image_set_path=str(dataset["image_set_path"]),
+            annotations_dir=str(dataset["annotations_dir"]),
+            unknown_classes=_string_tuple(dataset["unknown_classes"]),
+            known_classes=_string_tuple(dataset.get("known_classes")),
+            class_groups_path=_optional(dataset, "class_groups_path", str),
+            known_class_groups_path=_optional(dataset, "known_class_groups_path", str),
+            long_tail=LongTailConfig(
+                enabled=bool(long_tail.get("enabled", True)),
+                imbalance_ratio=float(long_tail.get("imbalance_ratio", 50.0)),
+            ),
+        )
+        if protocol:
+            validate_evaluation_assets(protocol, dataset_config, evaluation_config)
         config = ExperimentConfig(
             name=str(raw.get("name", "contribution-a")),
             active_learning=ActiveLearningConfig(
@@ -387,32 +884,10 @@ def load_config(path: str | Path) -> ExperimentConfig:
                 minimum_cluster_size=_optional(acquisition, "minimum_cluster_size", int),
                 weights=weights,
             ),
-            dataset=DatasetConfig(
-                image_set_path=str(dataset["image_set_path"]),
-                annotations_dir=str(dataset["annotations_dir"]),
-                unknown_classes=_string_tuple(dataset["unknown_classes"]),
-                known_classes=_string_tuple(dataset.get("known_classes")),
-                class_groups_path=_optional(dataset, "class_groups_path", str),
-                known_class_groups_path=_optional(dataset, "known_class_groups_path", str),
-                long_tail=LongTailConfig(
-                    enabled=bool(long_tail.get("enabled", True)),
-                    imbalance_ratio=float(long_tail.get("imbalance_ratio", 50.0)),
-                ),
-            ),
-            prob=ProbConfig(
-                repository_path=str(prob["repository_path"]),
-                initial_checkpoint=prob.get("initial_checkpoint"),
-                train_command=str(prob["train_command"]),
-                predict_command=str(prob["predict_command"]),
-                evaluate_command=str(prob["evaluate_command"]),
-                timeout_seconds=int(prob.get("timeout_seconds", 86400)),
-            ),
-            evaluation=EvaluationConfig(
-                grouped_metrics=bool(evaluation.get("grouped_metrics", True)),
-                iou_threshold=float(evaluation.get("iou_threshold", 0.5)),
-                unknown_prediction_name=str(evaluation.get("unknown_prediction_name", "unknown")),
-                require_detections=bool(evaluation.get("require_detections", True)),
-            ),
+            dataset=dataset_config,
+            prob=prob_config,
+            protocol=protocol,
+            evaluation=evaluation_config,
             output_dir=str(raw.get("output_dir", "outputs/contribution-a")),
             source_path=str(source),
             legacy_aliases=legacy_aliases,

@@ -134,10 +134,7 @@ class ProbAdapter:
         template: str,
         **values: object,
     ) -> None:
-        command = template.format(
-            repo=str(self.repository_path),
-            **{key: str(value) for key, value in values.items()},
-        )
+        command = self.render_command(template, **values)
 
         print("=" * 80)
         print("COMMAND:")
@@ -166,6 +163,57 @@ class ProbAdapter:
 
         result.check_returncode()
 
+    def render_command(self, template: str, **values: object) -> str:
+        """Resolve a configured command template without executing it."""
+
+        return template.format(
+            repo=str(self.repository_path),
+            **{key: str(value) for key, value in values.items()},
+        )
+
+    def resolved_train_command(
+        self,
+        *,
+        labelled_ids: str | Path,
+        previous_checkpoint: str | Path | None,
+        checkpoint: str | Path,
+        output_dir: str | Path,
+        round_index: int,
+        seed: int,
+    ) -> str:
+        return self.render_command(
+            self.train_command,
+            labelled_ids=labelled_ids,
+            previous_checkpoint=previous_checkpoint or "",
+            checkpoint=checkpoint,
+            output_dir=output_dir,
+            round=round_index,
+            seed=seed,
+        )
+
+    def resolved_predict_command(
+        self,
+        *,
+        image_ids: str | Path,
+        checkpoint: str | Path,
+        proposals: str | Path,
+    ) -> str:
+        return self.render_command(
+            self.predict_command,
+            image_ids=image_ids,
+            checkpoint=checkpoint,
+            proposals=proposals,
+            output_dir=Path(proposals).parent,
+        )
+
+    def resolved_evaluate_command(self, *, checkpoint: str | Path, metrics: str | Path) -> str:
+        return self.render_command(
+            self.evaluate_command,
+            checkpoint=checkpoint,
+            metrics=metrics,
+            output_dir=Path(metrics).parent,
+        )
+
     def train(
         self,
         labelled_image_ids: Sequence[str],
@@ -192,13 +240,14 @@ class ProbAdapter:
         )
 
         self._run(
-            self.train_command,
-            labelled_ids=labelled_path,
-            previous_checkpoint=previous_checkpoint or "",
-            checkpoint=checkpoint_path,
-            output_dir=directory,
-            round=round_index,
-            seed=seed,
+            self.resolved_train_command(
+                labelled_ids=labelled_path,
+                previous_checkpoint=previous_checkpoint,
+                checkpoint=checkpoint_path,
+                output_dir=directory,
+                round_index=round_index,
+                seed=seed,
+            ),
         )
 
         if not checkpoint_path.exists():
@@ -229,11 +278,11 @@ class ProbAdapter:
         )
 
         self._run(
-            self.predict_command,
-            image_ids=ids_path,
-            checkpoint=checkpoint,
-            proposals=output,
-            output_dir=output.parent,
+            self.resolved_predict_command(
+                image_ids=ids_path,
+                checkpoint=checkpoint,
+                proposals=output,
+            ),
         )
 
         if not output.exists():
@@ -260,10 +309,7 @@ class ProbAdapter:
         )
 
         self._run(
-            self.evaluate_command,
-            checkpoint=checkpoint,
-            metrics=output,
-            output_dir=output.parent,
+            self.resolved_evaluate_command(checkpoint=checkpoint, metrics=output),
         )
 
         if not output.exists():

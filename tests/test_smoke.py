@@ -19,7 +19,12 @@ from daowod.acquisition import (
     score_proposals,
     select_images,
 )
-from daowod.config import AcquisitionConfig, ConfigError, load_config
+from daowod.config import (
+    AcquisitionConfig,
+    ConfigError,
+    load_config,
+    validate_resolved_command_parity,
+)
 from daowod.dataset import DatasetState, build_long_tail_pool, file_sha256
 from daowod.experiment import run_active_round
 from daowod.metrics import Detection, GroundTruth, grouped_unknown_recall
@@ -390,6 +395,99 @@ output_dir: outputs/test
 """
 
 
+def _protocol_config(
+    tmp_path: Path,
+    *,
+    train_extra: str = "",
+    predict_extra: str = "",
+    evaluate_extra: str = "",
+    candidate_text: str = "a\n",
+) -> Path:
+    prob = tmp_path / "prob"
+    prob.mkdir()
+    checkpoint = tmp_path / "checkpoint.pth"
+    checkpoint.write_bytes(b"checkpoint")
+    candidate = tmp_path / "candidate.txt"
+    candidate.write_text(candidate_text, encoding="utf-8")
+    reference = tmp_path / "reference.txt"
+    reference.write_text("r\n", encoding="utf-8")
+    data_root = tmp_path / "data" / "OWOD"
+    eval_dir = data_root / "ImageSets" / "OWDETR"
+    annotations = data_root / "Annotations"
+    images = data_root / "JPEGImages"
+    eval_dir.mkdir(parents=True)
+    annotations.mkdir()
+    images.mkdir()
+    evaluation_split = eval_dir / "owdetr_test.txt"
+    evaluation_split.write_text("eval\n", encoding="utf-8")
+    _write_voc_xml(annotations / "eval.xml", ["known", "rare"])
+    (images / "eval.jpg").write_bytes(b"fake jpg")
+    config = tmp_path / "protocol.yaml"
+    common = (
+        f"--data-root {data_root} --dataset OWDETR --prev-introduced-classes 0 "
+        "--current-introduced-classes 19 --num-classes 81 --objectness-temperature 1"
+    )
+    config.write_text(
+        f"""
+name: protocol-test
+active_learning:
+  rounds: 1
+  strategy: v2:full
+  budget: 1
+  initial_images: 0
+  budget_per_round: 1
+  seeds: [0]
+protocol:
+  dataset_protocol: OWDETR
+  data_root: {data_root}
+  previous_introduced_classes: 0
+  current_introduced_classes: 19
+  num_classes: 81
+  objectness_temperature: 1
+  train_split: runtime_selected_ids
+  candidate_pool_split: {candidate}
+  reference_split: {reference}
+  evaluation_split: owdetr_test
+  evaluation_split_sha256: {file_sha256(evaluation_split)}
+  initial_labelled_split: null
+  checkpoint: {checkpoint}
+  checkpoint_sha256: fake
+  image_aggregation: top_k_mean
+  top_k: 3
+  uncertainty_method: entropy
+  clustering_method: current_v2_kmeans_shared_pool_seed
+  acquisition_budget: 1
+  active_learning_rounds: 1
+  training_schedule: "epochs=1,learning_rate=2e-5,eval_every=1,prob_unfrozen=true"
+  evaluation_settings: "grouped_metrics=true,iou_threshold=0.5,unknown_prediction_name=unknown,require_detections=true"
+  pool_policy: stage1_exact
+  reference_policy: fixed_stage1_representation_bank
+  long_tail_transformation: none
+acquisition:
+  strategies: [v2:full]
+  uncertainty_method: entropy
+dataset:
+  image_set_path: {candidate}
+  annotations_dir: {annotations}
+  unknown_classes: [rare]
+  known_classes: [known]
+  long_tail:
+    enabled: false
+    imbalance_ratio: 10.0
+prob:
+  repository_path: {prob}
+  initial_checkpoint: {checkpoint}
+  train_command: python bridge.py train --labelled-ids {{labelled_ids}} --previous-checkpoint {{previous_checkpoint}} --output-checkpoint {{checkpoint}} --output-dir {{output_dir}} {common} {train_extra}
+  predict_command: python bridge.py predict --image-ids {{image_ids}} --checkpoint {{checkpoint}} --output {{proposals}} {common} {predict_extra}
+  evaluate_command: python bridge.py evaluate --checkpoint {{checkpoint}} --output {{metrics}} --output-dir {{output_dir}} --test-set owdetr_test {common} {evaluate_extra}
+output_dir: {tmp_path / "out"}
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    return config
+
+
 def _write_config(tmp_path: Path, *, strategy: str, strategies: list[str]) -> Path:
     config_path = tmp_path / "experiment.yaml"
     config_path.write_text(
@@ -449,6 +547,120 @@ def test_load_config_accepts_multi_round_and_versioned_strategies(tmp_path: Path
     assert specs[2].coherence_exponent == pytest.approx(0.7)
     # The config fingerprint changes when the resolved specs change.
     assert len(config.fingerprint()) == 64
+
+
+def test_protocol_command_parity_accepts_explicit_owdetr_sowodb_config(tmp_path: Path) -> None:
+    config = load_config(_protocol_config(tmp_path))
+
+    assert config.protocol is not None
+    assert config.protocol.dataset_protocol == "OWDETR"
+    assert config.as_dict()["command_parity"]["status"] == "ok"
+
+
+def test_protocol_command_parity_rejects_towod_leaking_into_one_stage(tmp_path: Path) -> None:
+    path = _protocol_config(tmp_path, predict_extra="--dataset TOWOD")
+
+    with pytest.raises(ConfigError, match="predict: --dataset='TOWOD'"):
+        load_config(path)
+
+
+def test_protocol_command_parity_rejects_20_20_class_defaults(tmp_path: Path) -> None:
+    path = _protocol_config(
+        tmp_path,
+        train_extra="--prev-introduced-classes 20 --current-introduced-classes 20",
+    )
+
+    with pytest.raises(ConfigError, match="train: --prev-introduced-classes='20'"):
+        load_config(path)
+
+
+def test_protocol_command_parity_rejects_objectness_temperature_mismatch(
+    tmp_path: Path,
+) -> None:
+    path = _protocol_config(tmp_path, evaluate_extra="--objectness-temperature 1.3")
+
+    with pytest.raises(ConfigError, match="evaluate: --objectness-temperature='1.3'"):
+        load_config(path)
+
+
+def test_protocol_command_parity_rejects_inconsistent_evaluation_split(
+    tmp_path: Path,
+) -> None:
+    path = _protocol_config(tmp_path, evaluate_extra="--test-set other_test")
+
+    with pytest.raises(ConfigError, match="evaluate: --test-set='other_test'"):
+        load_config(path)
+
+
+def test_protocol_command_parity_rejects_missing_placeholder(tmp_path: Path) -> None:
+    path = _protocol_config(tmp_path)
+    text = path.read_text(encoding="utf-8").replace("--output {proposals}", "")
+    path.write_text(text, encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="predict: missing required argument --output"):
+        load_config(path)
+
+
+def test_resolved_command_parity_rejects_unresolved_or_missing_arguments(tmp_path: Path) -> None:
+    config = load_config(_protocol_config(tmp_path))
+    assert config.protocol is not None
+    commands = {
+        "train": (
+            "python bridge.py train --labelled-ids {labelled_ids} "
+            "--previous-checkpoint prev.pth --output-checkpoint out.pth --output-dir out "
+            "--data-root /data/OWOD --dataset OWDETR --prev-introduced-classes 0 "
+            "--current-introduced-classes 19 --num-classes 81 --objectness-temperature 1"
+        ),
+        "candidate_predict": (
+            "python bridge.py predict --image-ids ids.txt --checkpoint ckpt.pth "
+            "--output cand.npz --data-root /data/OWOD --dataset OWDETR "
+            "--prev-introduced-classes 0 --current-introduced-classes 19 "
+            "--num-classes 81 --objectness-temperature 1"
+        ),
+        "reference_predict": (
+            "python bridge.py predict --image-ids refs.txt --checkpoint ckpt.pth "
+            "--output refs.npz --data-root /data/OWOD --dataset OWDETR "
+            "--prev-introduced-classes 0 --current-introduced-classes 19 "
+            "--num-classes 81 --objectness-temperature 1"
+        ),
+        "evaluate": (
+            "python bridge.py evaluate --checkpoint out.pth --output metrics.json "
+            "--output-dir out --test-set owdetr_test --data-root /data/OWOD "
+            "--dataset OWDETR --prev-introduced-classes 0 "
+            "--current-introduced-classes 19 --num-classes 81 --objectness-temperature 1"
+        ),
+    }
+
+    with pytest.raises(ConfigError, match="unresolved placeholder"):
+        validate_resolved_command_parity(config.protocol, commands)
+
+
+def test_evaluation_validator_rejects_candidate_overlap(tmp_path: Path) -> None:
+    path = _protocol_config(tmp_path, candidate_text="eval\n")
+
+    with pytest.raises(ConfigError, match="overlaps the acquisition candidate pool"):
+        load_config(path)
+
+
+def test_evaluation_validator_rejects_digest_mismatch(tmp_path: Path) -> None:
+    path = _protocol_config(tmp_path)
+    text = path.read_text(encoding="utf-8").replace(
+        "evaluation_split_sha256: "
+        + file_sha256(path.parent / "data/OWOD/ImageSets/OWDETR/owdetr_test.txt"),
+        "evaluation_split_sha256: bad",
+    )
+    path.write_text(text, encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="Evaluation split digest mismatch"):
+        load_config(path)
+
+
+def test_evaluation_validator_rejects_missing_image(tmp_path: Path) -> None:
+    path = _protocol_config(tmp_path)
+    (path.parent / "data/OWOD/JPEGImages/eval.jpg").unlink()
+
+    with pytest.raises(ConfigError, match="missing image"):
+        load_config(path)
 
 
 def test_proposal_batch_npz_schema(tmp_path: Path) -> None:

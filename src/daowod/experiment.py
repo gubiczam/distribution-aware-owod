@@ -19,6 +19,7 @@ What each round writes, beyond the checkpoint and metrics:
 import csv
 import hashlib
 import json
+import os
 import random
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -26,8 +27,19 @@ from pathlib import Path
 from typing import Any
 
 from daowod import diagnostics as diag
-from daowod.config import EvaluationConfig, ExperimentConfig
-from daowod.dataset import DatasetState, build_long_tail_pool, file_sha256, read_image_ids
+from daowod.config import (
+    EvaluationConfig,
+    ExperimentConfig,
+    ProtocolConfig,
+    validate_resolved_command_parity,
+)
+from daowod.dataset import (
+    DatasetState,
+    build_long_tail_pool,
+    file_sha256,
+    read_image_ids,
+    read_voc_classes,
+)
 from daowod.groups import ClassGroups
 from daowod.metrics import (
     grouped_detection_metrics,
@@ -39,6 +51,16 @@ from daowod.prob_adapter import ProbAdapter
 from daowod.scoring import ScoringResult, StrategySpec, score_pool, select_images
 
 PROTOCOL_VERSION = 2
+CLASS_ALIASES = {
+    "airplane": "aeroplane",
+    "motorcycle": "motorbike",
+    "couch": "sofa",
+    "dining table": "diningtable",
+    "potted plant": "pottedplant",
+    "tv": "tvmonitor",
+}
+
+RESUME_COMPLETED_ENV = "DAOWOD_RESUME_COMPLETED"
 
 
 def derive_seed(*parts: object) -> int:
@@ -84,6 +106,55 @@ class RoundResult:
     artifacts: dict[str, Path] = field(default_factory=dict)
 
 
+def _load_completed_round(round_dir: Path) -> RoundResult:
+    """Load and validate one completed round for opt-in campaign resume."""
+
+    manifest_path = round_dir / "round_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("completed") is not True:
+        raise ValueError(f"Round manifest is not completed: {manifest_path}")
+
+    required = {
+        "selected_ids": round_dir / "selected_ids.txt",
+        "labelled_ids": round_dir / "labelled_ids.txt",
+        "remaining_pool_ids": round_dir / "remaining_pool_ids.txt",
+        "metrics": round_dir / "metrics.json",
+        "checkpoint": round_dir / "checkpoint.pth",
+    }
+    missing = [
+        name for name, path in required.items() if not path.exists() or path.stat().st_size == 0
+    ]
+    if missing:
+        raise ValueError(f"Completed round is missing required artifacts {missing}: {round_dir}")
+
+    metrics = json.loads(required["metrics"].read_text(encoding="utf-8"))
+    grouped_path = round_dir / "grouped_metrics.json"
+    grouped = json.loads(grouped_path.read_text(encoding="utf-8")) if grouped_path.exists() else {}
+    artifacts = {
+        name: path
+        for name, path in (
+            ("candidate_proposals", round_dir / "candidate_proposals.npz"),
+            ("reference_proposals", round_dir / "reference_proposals.npz"),
+            ("proposal_scores", round_dir / "proposal_scores.csv"),
+            ("image_scores", round_dir / "image_scores.csv"),
+            ("component_diagnostics", round_dir / "component_diagnostics.json"),
+            ("grouped_metrics", grouped_path),
+        )
+        if path.exists()
+    }
+    return RoundResult(
+        selected_image_ids=read_image_ids(required["selected_ids"]),
+        remaining_candidate_ids=read_image_ids(required["remaining_pool_ids"]),
+        labelled_ids=read_image_ids(required["labelled_ids"]),
+        checkpoint_path=required["checkpoint"],
+        metrics_path=required["metrics"],
+        round_manifest_path=manifest_path,
+        metrics=dict(metrics),
+        grouped_metrics=dict(grouped),
+        artifacts=artifacts,
+    )
+
+
 @dataclass(frozen=True)
 class ExperimentResult:
     """Generated metrics, selections and output location."""
@@ -113,6 +184,49 @@ def _write_json(path: Path, data: Mapping[str, Any]) -> None:
         json.dumps(data, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8"
     )
     temporary.replace(path)
+
+
+def _id_digest(values: Sequence[str]) -> str:
+    payload = "\n".join(str(value) for value in values)
+    if values:
+        payload += "\n"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _support_counts(
+    image_ids: Sequence[str],
+    *,
+    annotations_dir: str,
+    unknown_classes: Sequence[str],
+    known_classes: Sequence[str],
+    class_groups: ClassGroups | None,
+) -> dict[str, Any]:
+    unknown_set = set(unknown_classes)
+    known_set = set(known_classes)
+    counts = {
+        "image_count": len(image_ids),
+        "known_objects": 0,
+        "unknown_objects": 0,
+        "head_objects": 0,
+        "medium_objects": 0,
+        "tail_objects": 0,
+        "by_class": {},
+    }
+    by_class: dict[str, int] = {}
+    for image_id in image_ids:
+        for raw_name in read_voc_classes(image_id, annotations_dir):
+            class_name = CLASS_ALIASES.get(raw_name, raw_name)
+            by_class[class_name] = by_class.get(class_name, 0) + 1
+            if class_name in known_set:
+                counts["known_objects"] += 1
+            if class_name in unknown_set:
+                counts["unknown_objects"] += 1
+                if class_groups is not None:
+                    group = class_groups.groups.get(class_name)
+                    if group in ("head", "medium", "tail"):
+                        counts[f"{group}_objects"] += 1
+    counts["by_class"] = by_class
+    return counts
 
 
 def _write_image_scores(path: Path, image_scores: Mapping[str, float]) -> None:
@@ -175,6 +289,7 @@ def run_active_round(
     candidate_ids: Sequence[str],
     reference_ids: Sequence[str],
     labelled_ids: Sequence[str],
+    evaluation_ids: Sequence[str] = (),
     output_dir: str | Path,
     spec: StrategySpec,
     budget: int,
@@ -185,7 +300,9 @@ def run_active_round(
     unknown_classes: Sequence[str] = (),
     known_classes: Sequence[str] = (),
     known_class_groups: ClassGroups | None = None,
+    annotations_dir: str = "",
     evaluation: EvaluationConfig | None = None,
+    protocol: ProtocolConfig | None = None,
     export_proposals_for_random: bool = False,
 ) -> RoundResult:
     """Run one detector-backed active-learning round with any strategy.
@@ -232,13 +349,62 @@ def run_active_round(
     diagnostics_path = round_dir / "component_diagnostics.json"
     grouped_metrics_path = round_dir / "grouped_metrics.json"
     selected_path = round_dir / "selected_ids.txt"
+    reference_path = round_dir / "reference_ids.txt"
+    labelled_before_path = round_dir / "labelled_ids_before_selection.txt"
     labelled_path = round_dir / "labelled_ids.txt"
+    training_path = round_dir / "training_ids.txt"
     remaining_path = round_dir / "remaining_pool_ids.txt"
+    candidates_before_path = round_dir / "candidate_ids_before_selection.txt"
+    evaluation_path = round_dir / "evaluation_ids.txt"
     checkpoint_path = round_dir / "checkpoint.pth"
     metrics_path = round_dir / "metrics.json"
 
     pool_seed = derive_pool_seed(seed, round_index)
     identifier = run_id or f"{spec.name}-s{seed}-r{round_index}"
+
+    support_counts = {}
+    if annotations_dir:
+        support_counts = {
+            "candidate_pool_before": _support_counts(
+                candidates,
+                annotations_dir=annotations_dir,
+                unknown_classes=unknown_classes,
+                known_classes=known_classes,
+                class_groups=class_groups,
+            ),
+            "reference": _support_counts(
+                references,
+                annotations_dir=annotations_dir,
+                unknown_classes=unknown_classes,
+                known_classes=known_classes,
+                class_groups=class_groups,
+            ),
+            "labelled_before": _support_counts(
+                labelled,
+                annotations_dir=annotations_dir,
+                unknown_classes=unknown_classes,
+                known_classes=known_classes,
+                class_groups=class_groups,
+            ),
+            "evaluation": _support_counts(
+                evaluation_ids,
+                annotations_dir=annotations_dir,
+                unknown_classes=unknown_classes,
+                known_classes=known_classes,
+                class_groups=class_groups,
+            ),
+        }
+        if evaluation_ids and settings.grouped_metrics and class_groups is not None:
+            missing_groups = [
+                group
+                for group in ("head", "medium", "tail")
+                if support_counts["evaluation"][f"{group}_objects"] == 0
+            ]
+            if missing_groups:
+                raise RuntimeError(
+                    "Evaluation split has zero grouped-metric support for "
+                    f"{missing_groups}; refusing to train."
+                )
 
     manifest: dict[str, Any] = {
         "protocol_version": PROTOCOL_VERSION,
@@ -255,10 +421,24 @@ def run_active_round(
         "candidate_count_before": len(candidates),
         "labelled_count_before": len(labelled),
         "reference_count": len(references),
+        "evaluation_count": len(evaluation_ids),
         "image_aggregation": {
             "method": spec.image_aggregation,
             "top_k": spec.top_k,
         },
+        "id_list_sha256_before": {
+            "candidate_ids": _id_digest(candidates),
+            "reference_ids": _id_digest(references),
+            "labelled_ids": _id_digest(labelled),
+            "evaluation_ids": _id_digest(evaluation_ids),
+        },
+        "overlap_policy": {
+            "candidate_reference_overlap": sorted(set(candidates) & set(references))[:20],
+            "candidate_labelled_overlap": sorted(set(candidates) & set(labelled))[:20],
+            "candidate_evaluation_overlap": sorted(set(candidates) & set(evaluation_ids))[:20],
+            "labelled_evaluation_overlap": sorted(set(labelled) & set(evaluation_ids))[:20],
+        },
+        "support_counts": support_counts,
         "completed": False,
     }
     _write_json(manifest_path, manifest)
@@ -334,9 +514,52 @@ def run_active_round(
     selected_set = set(selected)
     cumulative_labelled = [*labelled, *selected]
     remaining = [image_id for image_id in candidates if image_id not in selected_set]
+    _write_ids(candidates_before_path, candidates)
+    _write_ids(reference_path, references)
+    _write_ids(labelled_before_path, labelled)
     _write_ids(selected_path, selected)
     _write_ids(labelled_path, cumulative_labelled)
+    _write_ids(training_path, cumulative_labelled)
     _write_ids(remaining_path, remaining)
+    _write_ids(evaluation_path, evaluation_ids)
+    if not set(selected).issubset(candidates):
+        raise ValueError("Selected IDs must be a subset of the candidate pool.")
+    if set(selected) & set(labelled):
+        raise ValueError("Selected IDs were already labelled.")
+    if len(cumulative_labelled) != len(labelled) + len(selected):
+        raise ValueError("Labelled set did not grow exactly by the selected budget.")
+
+    resolved_commands = {}
+    if hasattr(adapter, "resolved_train_command"):
+        resolved_commands["train"] = adapter.resolved_train_command(
+            labelled_ids=labelled_path,
+            previous_checkpoint=checkpoint,
+            checkpoint=checkpoint_path,
+            output_dir=round_dir,
+            round_index=round_index,
+            seed=seed,
+        )
+    if hasattr(adapter, "resolved_predict_command"):
+        resolved_commands["candidate_predict"] = adapter.resolved_predict_command(
+            image_ids=candidate_proposals_path.with_suffix(".ids.txt"),
+            checkpoint=checkpoint,
+            proposals=candidate_proposals_path,
+        )
+        resolved_commands["reference_predict"] = adapter.resolved_predict_command(
+            image_ids=reference_proposals_path.with_suffix(".ids.txt"),
+            checkpoint=checkpoint,
+            proposals=reference_proposals_path,
+        )
+    if hasattr(adapter, "resolved_evaluate_command"):
+        resolved_commands["evaluate"] = adapter.resolved_evaluate_command(
+            checkpoint=checkpoint_path,
+            metrics=metrics_path,
+        )
+    resolved_command_parity = (
+        validate_resolved_command_parity(protocol, resolved_commands)
+        if protocol is not None
+        else None
+    )
 
     try:
         trained_checkpoint = adapter.train(
@@ -382,8 +605,15 @@ def run_active_round(
             "candidate_count_after": len(remaining),
             "labelled_count_after": len(cumulative_labelled),
             "selected_ids_sha256": file_sha256(selected_path),
+            "candidate_ids_before_sha256": file_sha256(candidates_before_path),
+            "reference_ids_sha256": file_sha256(reference_path),
+            "labelled_ids_before_sha256": file_sha256(labelled_before_path),
             "remaining_pool_sha256": file_sha256(remaining_path),
             "labelled_ids_sha256": file_sha256(labelled_path),
+            "training_ids_sha256": file_sha256(training_path),
+            "evaluation_ids_sha256": file_sha256(evaluation_path),
+            "resolved_commands": resolved_commands,
+            "resolved_command_parity": resolved_command_parity,
             "candidate_proposals_sha256": (
                 file_sha256(candidate_proposals_path) if candidate_proposals_path.exists() else None
             ),
@@ -466,6 +696,13 @@ class ActiveLearningCampaign:
 
     def _prepare_pool(self, *, seed: int, output_root: Path) -> dict[str, Any]:
         dataset = self.config.dataset
+        if self.config.protocol and self.config.protocol.pool_policy == "stage1_exact":
+            return {
+                "selected_image_ids": read_image_ids(self.config.protocol.candidate_pool_split),
+                "class_stats_path": dataset.class_groups_path,
+                "pool_split_path": self.config.protocol.candidate_pool_split,
+                "pool_policy": self.config.protocol.pool_policy,
+            }
         if not dataset.long_tail.enabled:
             return {
                 "selected_image_ids": read_image_ids(dataset.image_set_path),
@@ -517,23 +754,81 @@ class ActiveLearningCampaign:
         checkpoint: str | Path | None = self.config.prob.initial_checkpoint
         if checkpoint is None:
             raise ValueError("prob.initial_checkpoint is required to run a campaign.")
+        fixed_reference_policies = {
+            "fixed_stage1_representation_bank",
+            "fixed_stage1b_representation_bank",
+        }
+        reference_bank_ids = (
+            read_image_ids(self.config.protocol.reference_split)
+            if self.config.protocol
+            and self.config.protocol.reference_policy in fixed_reference_policies
+            else None
+        )
+        evaluation_ids = (
+            read_image_ids(
+                Path(self.config.protocol.data_root)
+                / "ImageSets"
+                / self.config.protocol.dataset_protocol
+                / f"{self.config.protocol.evaluation_split}.txt"
+            )
+            if self.config.protocol
+            else []
+        )
 
         metrics_rows: list[dict[str, object]] = []
         selection_rows: list[dict[str, object]] = []
         candidates = list(state.pool_ids)
         labelled = list(state.labelled_ids)
+        resume_completed = os.environ.get(RESUME_COMPLETED_ENV) == "1"
 
         for round_index in range(1, settings.rounds + 1):
             budget = min(settings.budget_per_round, len(candidates))
             if budget < 1:
                 break
+            round_dir = run_dir / f"round_{round_index:02d}"
+            if resume_completed and (round_dir / "round_manifest.json").exists():
+                result = _load_completed_round(round_dir)
+                metrics_rows.append(
+                    {
+                        "strategy": spec.name,
+                        "semantics_version": spec.semantics_version,
+                        "seed": seed,
+                        "round": round_index,
+                        "cumulative_budget": round_index * settings.budget_per_round,
+                        "labelled_images": len(result.labelled_ids),
+                        **{
+                            key: value
+                            for key, value in result.metrics.items()
+                            if isinstance(value, int | float | str) or value is None
+                        },
+                        **{
+                            key: value
+                            for key, value in result.grouped_metrics.items()
+                            if isinstance(value, int | float | str) or value is None
+                        },
+                    }
+                )
+                selection_rows.append(
+                    {
+                        "strategy": spec.name,
+                        "semantics_version": spec.semantics_version,
+                        "seed": seed,
+                        "after_round": round_index,
+                        "selected_image_ids": result.selected_image_ids,
+                    }
+                )
+                candidates = list(result.remaining_candidate_ids)
+                labelled = list(result.labelled_ids)
+                checkpoint = result.checkpoint_path
+                continue
             result = run_active_round(
                 adapter=self.detector,
                 checkpoint=checkpoint,
                 candidate_ids=candidates,
-                reference_ids=labelled,
-                labelled_ids=[],
-                output_dir=run_dir / f"round_{round_index:02d}",
+                reference_ids=reference_bank_ids or labelled,
+                labelled_ids=labelled,
+                evaluation_ids=evaluation_ids,
+                output_dir=round_dir,
                 spec=spec,
                 budget=budget,
                 seed=seed,
@@ -543,7 +838,9 @@ class ActiveLearningCampaign:
                 unknown_classes=self.config.dataset.unknown_classes,
                 known_classes=self.config.dataset.known_classes,
                 known_class_groups=known_class_groups,
+                annotations_dir=self.config.dataset.annotations_dir,
                 evaluation=self.config.evaluation,
+                protocol=self.config.protocol,
             )
             metrics_rows.append(
                 {
@@ -556,12 +853,12 @@ class ActiveLearningCampaign:
                     **{
                         key: value
                         for key, value in result.metrics.items()
-                        if isinstance(value, (int, float, str)) or value is None
+                        if isinstance(value, int | float | str) or value is None
                     },
                     **{
                         key: value
                         for key, value in result.grouped_metrics.items()
-                        if isinstance(value, (int, float, str)) or value is None
+                        if isinstance(value, int | float | str) or value is None
                     },
                 }
             )
