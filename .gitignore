@@ -15,8 +15,13 @@ env/
 data/*
 !data/protocol/
 data/protocol/*
+# Version-controlled protocol assets. Anything a clean clone needs in order to
+# run must be whitelisted here; see analysis/audit_clean_clone_assets.py, which
+# fails the build when a required input is only reachable from an ignored path.
 !data/protocol/stage1b/
 !data/protocol/stage1b/*.txt
+!data/protocol/stage2/
+!data/protocol/stage2/*.csv
 outputs/
 checkpoints/
 runs/

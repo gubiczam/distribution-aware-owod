@@ -1,0 +1,62 @@
+class_name,group
+apple,medium
+backpack,head
+banana,tail
+baseball bat,tail
+baseball glove,tail
+bed,tail
+bench,head
+book,head
+bottle,head
+bowl,head
+broccoli,tail
+cake,tail
+carrot,tail
+cell phone,medium
+chair,head
+clock,medium
+cup,head
+diningtable,head
+donut,medium
+fire hydrant,tail
+fork,medium
+frisbee,medium
+hair drier,tail
+handbag,head
+hot dog,medium
+keyboard,medium
+kite,tail
+knife,head
+laptop,head
+microwave,medium
+mouse,medium
+orange,medium
+oven,head
+parking meter,medium
+pizza,tail
+pottedplant,head
+refrigerator,head
+remote,tail
+sandwich,tail
+scissors,medium
+sink,head
+skateboard,tail
+skis,tail
+snowboard,tail
+sofa,medium
+spoon,head
+sports ball,tail
+stop sign,medium
+suitcase,medium
+surfboard,tail
+teddy bear,medium
+tennis racket,tail
+tie,medium
+toaster,tail
+toilet,head
+toothbrush,medium
+traffic light,head
+tvmonitor,head
+umbrella,medium
+vase,head
+wine glass,head

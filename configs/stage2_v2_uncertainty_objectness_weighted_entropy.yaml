@@ -141,7 +141,7 @@ dataset:
     - giraffe
     - truck
     - person
-  class_groups_path: outputs/stage2_plan/stage2_class_groups.csv
+  class_groups_path: data/protocol/stage2/stage2_class_groups.csv
   known_class_groups_path: null
   long_tail:
     enabled: false

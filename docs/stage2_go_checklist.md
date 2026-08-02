@@ -12,6 +12,7 @@ Current verdict: CONDITIONAL GO.
 - [x] Scientific early stopping is removed from preregistration.
 - [x] Seed policy and variance-based escalation rule are preregistered.
 - [x] Stage 2 configs validate locally. They must pass locally before the smoke run.
+- [x] Every required input survives a clean clone. `analysis/audit_clean_clone_assets.py` passes, so no config or notebook path resolves into an ignored tree such as `outputs/`.
 - [x] Tests pass locally.
 - [x] Resolved commands are written into every round manifest before training.
 - [x] Data-lineage ID lists, hashes, overlaps, and support counts are written per round.

@@ -37,6 +37,12 @@ TOP_K = 3
 DATA_ROOT = Path("/Users/gubiczam/owod_stage")
 EVALUATION_SPLIT = "owdetr_test"
 
+# The class-group mapping is a protocol input, not a run artifact: a clean clone
+# must carry it, because every Stage 2 config resolves it relative to the repo
+# root. It is written to the planning output directory for provenance *and* to
+# this version-controlled location, which is what the configs point at.
+PROTOCOL_CLASS_GROUPS_PATH = Path("data/protocol/stage2/stage2_class_groups.csv")
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -1071,7 +1077,10 @@ def write_stage2_configs(
     configs_dir.mkdir(parents=True, exist_ok=True)
     for old in configs_dir.glob("stage2_*.yaml"):
         old.unlink()
-    class_groups_path = output_dir / "stage2_class_groups.csv"
+    # Point the emitted configs at the tracked protocol copy, never at
+    # output_dir: output_dir lives under the ignored outputs/ tree and would be
+    # absent from a clean clone.
+    class_groups_path = PROTOCOL_CLASS_GROUPS_PATH
     evaluation_path = DATA_ROOT / "ImageSets" / "OWDETR" / f"{EVALUATION_SPLIT}.txt"
     evaluation_digest = split_digest(evaluation_path)
     if evaluation_digest is None:
@@ -1367,6 +1376,8 @@ def write_protocol_doc(
         "- Decision: Option A.",
         f"- Candidate pool: leak-free Stage 1B candidate split, `{preflight['candidate_split_path']}`.",
         f"- Representation reference bank: leak-free Stage 1B fixed bank, `{preflight['reference_split_path']}`.",
+        f"- Class-group mapping: version-controlled protocol asset, `{PROTOCOL_CLASS_GROUPS_PATH.as_posix()}`. "
+        "It is a protocol input, not a run artifact, so a clean clone can resolve it.",
         "- Long-tail transformation: disabled. `dataset.long_tail.enabled=false` and `protocol.long_tail_transformation=none` preserve real Stage 1B comparability.",
         "- Initial labelled split: none. Stage 2 starts with zero labelled candidate-pool images so first-round acquisition sees the exact Stage 1B candidate pool.",
         f"- Evaluation split: fixed `owdetr_test`, SHA256 `{preflight['evaluation_split_sha256']}`.",
@@ -1756,6 +1767,7 @@ Current verdict: {verdict}.
 - [x] Scientific early stopping is removed from preregistration.
 - [x] Seed policy and variance-based escalation rule are preregistered.
 - {config_check} Stage 2 configs validate locally. {config_note}
+- [x] Every required input survives a clean clone. `analysis/audit_clean_clone_assets.py` passes, so no config or notebook path resolves into an ignored tree such as `outputs/`.
 - [x] Tests pass locally.
 - [x] Resolved commands are written into every round manifest before training.
 - [x] Data-lineage ID lists, hashes, overlaps, and support counts are written per round.
@@ -1848,6 +1860,9 @@ def main() -> int:
         output_dir=args.output_dir,
     )
     write_class_groups(args.output_dir / "stage2_class_groups.csv", groups)
+    # Keep the version-controlled protocol copy in step with the run artifact;
+    # the Stage 2 configs resolve class_groups_path against this one.
+    write_class_groups(PROTOCOL_CLASS_GROUPS_PATH, groups)
     preflight = write_protocol_preflight(
         output_dir=args.output_dir,
         candidate_ids_path=args.candidate_ids,
