@@ -46,6 +46,18 @@ COMPONENT_NAMES: tuple[str, ...] = (
     "gated",
 )
 
+#: Where the distribution-aware term's rarity and coherence come from.
+#:
+#: ``cluster``  the original, fully unsupervised path: k-means pseudo-classes for
+#:              rarity and pool density for coherence. This is the published
+#:              baseline and stays the default, so no existing strategy changes.
+#: ``revealed`` label-anchored: rarity from the nearest *revealed* class and
+#:              coherence from similarity to regions the oracle has already
+#:              confirmed as unknown objects. Falls back to ``cluster`` values
+#:              until labels exist, so cold rounds are identical.
+DistributionEstimator = Literal["cluster", "revealed"]
+DISTRIBUTION_ESTIMATORS: tuple[str, ...] = ("cluster", "revealed")
+
 ImageAggregation = Literal["top_k_mean", "max", "mean", "noisy_or"]
 IMAGE_AGGREGATIONS: tuple[str, ...] = ("top_k_mean", "max", "mean", "noisy_or")
 
@@ -78,6 +90,10 @@ class StrategySpec:
     singleton_coherence: float = 0.0
     minimum_cluster_size: int = 3
     isolation_quantile: float = 0.9
+    radius_quantile: float = 0.1
+    minimum_samples: int = 4
+    distribution_estimator: str = "cluster"
+    support_neighbours: int = 5
     image_aggregation: str = "top_k_mean"
     top_k: int = 3
     weight_normalise: bool = False
@@ -135,6 +151,17 @@ class StrategySpec:
             )
         if min(self.cluster_count, self.neighbour_count, self.top_k) < 1:
             raise StrategyError(f"{self.name}: integer parameters must be positive.")
+        if not 0.0 < self.radius_quantile < 1.0:
+            raise StrategyError(f"{self.name}: radius_quantile must lie strictly in (0, 1).")
+        if self.minimum_samples < 2:
+            raise StrategyError(f"{self.name}: minimum_samples must be >= 2.")
+        if self.distribution_estimator not in DISTRIBUTION_ESTIMATORS:
+            raise StrategyError(
+                f"{self.name}: unknown distribution_estimator "
+                f"{self.distribution_estimator!r}. Supported: {list(DISTRIBUTION_ESTIMATORS)}"
+            )
+        if self.support_neighbours < 1:
+            raise StrategyError(f"{self.name}: support_neighbours must be positive.")
 
     def weights(self) -> dict[str, float]:
         return {
@@ -181,6 +208,10 @@ class StrategySpec:
             self.singleton_coherence,
             self.minimum_cluster_size,
             self.isolation_quantile,
+            self.radius_quantile,
+            self.minimum_samples,
+            self.distribution_estimator,
+            self.support_neighbours,
             self.image_aggregation,
             self.top_k,
             self.weight_normalise,
@@ -209,6 +240,10 @@ class StrategySpec:
             "singleton_coherence": self.singleton_coherence,
             "minimum_cluster_size": self.minimum_cluster_size,
             "isolation_quantile": self.isolation_quantile,
+            "radius_quantile": self.radius_quantile,
+            "minimum_samples": self.minimum_samples,
+            "distribution_estimator": self.distribution_estimator,
+            "support_neighbours": self.support_neighbours,
             "image_aggregation": self.image_aggregation,
             "top_k": self.top_k,
             "weight_normalise": self.weight_normalise,
@@ -428,6 +463,76 @@ _VERSION_2: tuple[StrategySpec, ...] = (
         "S = U + lambda*D + gamma*w(c)*coh, i.e. both an ungated and a gated "
         "distribution term.",
     ),
+    # --- informativeness prior ------------------------------------------------
+    # The audit's control arm. Measured on the real Task-1 pool, objectness x box
+    # scale reaches ROC-AUC 0.777 for unknown-versus-background where every
+    # semantic component sits near 0.48, and a static sort by it finds 85 unknown
+    # objects in a 2 000-region budget against 16 for v2:full. A distribution-aware
+    # method that does not beat this is not earning its complexity, so it is an arm
+    # of the comparison rather than a remark in the discussion.
+    StrategySpec(
+        name="objectness_area_prior",
+        uncertainty_weight=1.0,
+        uncertainty_method="objectness_area_prior",
+        description="Informativeness prior only: objectness x box scale. The "
+        "free-heuristic control every semantic strategy is read against.",
+    ),
+    StrategySpec(
+        name="prior_full",
+        uncertainty_weight=_V2_ALPHA,
+        novelty_weight=_V2_BETA,
+        gated_weight=_V2_GAMMA,
+        uncertainty_method="objectness_area_prior",
+        description="Contribution A's composition with the informativeness prior in "
+        "the U slot: does distribution-awareness add anything on top of a prior "
+        "that already works?",
+    ),
+    StrategySpec(
+        name="prior_revealed_full",
+        uncertainty_weight=_V2_ALPHA,
+        novelty_weight=_V2_BETA,
+        gated_weight=_V2_GAMMA,
+        uncertainty_method="objectness_area_prior",
+        distribution_estimator="revealed",
+        description="The informativeness prior plus the label-anchored "
+        "distribution term: the strongest combination the audit motivates.",
+    ),
+    # --- label-anchored distribution estimation ------------------------------
+    # Same formula, same weights, same gate form as v2:full. The single changed
+    # variable is where rarity and coherence come from: the regions the oracle has
+    # already confirmed, rather than k-means over a pool that is 75 % background.
+    # Motivated by the measured 0.35 ROC-AUC gap between what the decoder features
+    # support (supervised probe 0.837) and what the unsupervised estimators extract
+    # (0.44-0.49); see daowod.revealed.
+    StrategySpec(
+        name="revealed_full",
+        uncertainty_weight=_V2_ALPHA,
+        novelty_weight=_V2_BETA,
+        gated_weight=_V2_GAMMA,
+        distribution_estimator="revealed",
+        description="Contribution A with a label-anchored distribution term: "
+        "entropy + novelty + gated (revealed-class rarity x revealed-unknown "
+        "support).",
+    ),
+    StrategySpec(
+        name="revealed_no_gate",
+        uncertainty_weight=_V2_ALPHA,
+        novelty_weight=_V2_BETA,
+        rarity_weight=_V2_GAMMA,
+        distribution_estimator="revealed",
+        description="Label-anchored rarity without the support gate, isolating "
+        "what the gate's form contributes once rarity is anchored.",
+    ),
+    StrategySpec(
+        name="revealed_support_only",
+        uncertainty_weight=_V2_ALPHA,
+        novelty_weight=_V2_BETA,
+        coherence_weight=_V2_GAMMA,
+        distribution_estimator="revealed",
+        description="Revealed-unknown support with no rarity term, isolating how "
+        "much of any gain is 'resembles a confirmed unknown' rather than "
+        "'belongs to a rare class'.",
+    ),
 )
 
 
@@ -524,6 +629,12 @@ REQUIRED_STRATEGIES: tuple[str, ...] = (
     "v2:full_no_uncertainty",
     "v2:full_no_novelty",
     "v2:proposal_formula",
+    "v2:revealed_full",
+    "v2:objectness_area_prior",
+    "v2:prior_full",
+    "v2:prior_revealed_full",
+    "v2:revealed_no_gate",
+    "v2:revealed_support_only",
     "v1:rarity_no_coherence",
     "v1:full_p05",
     "v1:full_p1",
@@ -694,6 +805,8 @@ def score_pool(
     confidence: ArrayLike | None = None,
     posterior: ArrayLike | None = None,
     predicted_labels: ArrayLike | None = None,
+    objectness: ArrayLike | None = None,
+    boxes_cxcywh: ArrayLike | None = None,
     seed: int = 0,
     compute_all_components: bool = False,
 ) -> ScoringResult:
@@ -710,6 +823,13 @@ def score_pool(
     count = vectors.shape[0]
     if ids.ndim != 1 or ids.shape[0] != count:
         raise ValueError("image_ids must be parallel to embeddings.")
+    if spec.uncertainty_method == "objectness_area_prior" and (
+        objectness is None or boxes_cxcywh is None
+    ):
+        raise ValueError(
+            f"Strategy {spec.name!r} uses the objectness/box-scale informativeness "
+            "prior, which needs the exported objectness and boxes."
+        )
     if spec.needs_posterior() and posterior is None:
         raise ValueError(
             f"Strategy {spec.name!r} uses uncertainty method "
@@ -730,7 +850,11 @@ def score_pool(
 
     if weights["uncertainty"] > 0 or compute_all_components:
         raw["uncertainty"] = components.compute_uncertainty(
-            method=spec.uncertainty_method, posterior=posterior, confidence=confidence
+            method=spec.uncertainty_method,
+            posterior=posterior,
+            confidence=confidence,
+            objectness=objectness,
+            boxes_cxcywh=boxes_cxcywh,
         )
     else:
         raw["uncertainty"] = np.zeros(count, dtype=np.float64)
@@ -759,6 +883,8 @@ def score_pool(
             singleton_coherence=spec.singleton_coherence,
             minimum_cluster_size=spec.minimum_cluster_size,
             isolation_quantile=spec.isolation_quantile,
+            radius_quantile=spec.radius_quantile,
+            minimum_samples=spec.minimum_samples,
         )
     else:
         coherence_result = components.CoherenceResult(

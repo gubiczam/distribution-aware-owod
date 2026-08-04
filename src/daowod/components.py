@@ -35,6 +35,7 @@ UncertaintyMethod = Literal[
     "margin",
     "one_minus_max",
     "objectness_weighted_entropy",
+    "objectness_area_prior",
     "legacy_prob_score",
 ]
 UNCERTAINTY_METHODS: tuple[str, ...] = (
@@ -42,6 +43,7 @@ UNCERTAINTY_METHODS: tuple[str, ...] = (
     "margin",
     "one_minus_max",
     "objectness_weighted_entropy",
+    "objectness_area_prior",
     "legacy_prob_score",
 )
 
@@ -52,11 +54,17 @@ RARITY_METHODS: tuple[str, ...] = (
     "negative_count",
 )
 
-CoherenceMethod = Literal["relative_within_cluster", "neighbour_consistency", "density"]
+CoherenceMethod = Literal[
+    "relative_within_cluster",
+    "neighbour_consistency",
+    "density",
+    "radius_core",
+]
 COHERENCE_METHODS: tuple[str, ...] = (
     "relative_within_cluster",
     "neighbour_consistency",
     "density",
+    "radius_core",
 )
 
 PseudoLabelSource = Literal["cluster", "predicted"]
@@ -103,14 +111,33 @@ def compute_uncertainty(
     method: UncertaintyMethod = "entropy",
     posterior: ArrayLike | None = None,
     confidence: ArrayLike | None = None,
+    objectness: ArrayLike | None = None,
+    boxes_cxcywh: ArrayLike | None = None,
 ) -> FloatArray:
-    """Proposal uncertainty on an approximately [0, 1] scale.
+    """Proposal informativeness on an approximately [0, 1] scale.
 
     ``entropy``                     -sum p log(p + eps) / log(K)
     ``margin``                      1 - (p_top1 - p_top2)
     ``one_minus_max``               1 - p_top1
     ``objectness_weighted_entropy`` sqrt(entropy * unknown score)
+    ``objectness_area_prior``       objectness * sqrt(box area)
     ``legacy_prob_score``           1 - |2c - 1| (deprecated, see audit S2)
+
+    ``objectness_area_prior`` is not an uncertainty at all; it occupies the same
+    ``U(x)`` slot as an *informativeness prior*, and it is here because the audit
+    measured it to be the strongest signal available without labels. On the real
+    2 400-image Task-1 pool its ROC-AUC for "sits on an unknown object versus
+    background" is 0.777, against 0.624 for PROB's own unknown score, 0.483 for
+    posterior entropy and 0.481 for the coherence term. Sorting the pool by it
+    finds 85 unknown objects inside a 2 000-region budget where the full
+    distribution-aware strategy finds 16. Any semantic acquisition term has to be
+    read against that number, so the term is available as a first-class arm rather
+    than only as a footnote in the analysis.
+
+    Why box scale carries so much: PROB emits one proposal per decoder query and
+    the background queries settle on small, low-scale boxes, so scale separates
+    "region that contains something" from "patch of texture" more reliably than any
+    of the model's semantic heads do at Task 1.
 
     A caution measured on a PROB-calibrated pool and recorded in
     ``docs/decisions.md``: PROB's posterior is
@@ -145,6 +172,27 @@ def compute_uncertainty(
 
         return np.sqrt(normalise(entropy, "rank") * normalise(score, "rank"))
 
+    if method == "objectness_area_prior":
+        if objectness is None or boxes_cxcywh is None:
+            raise ValueError(
+                "objectness_area_prior requires both objectness and boxes_cxcywh; "
+                "re-export proposals with a bridge that writes 'objectness' and "
+                "'boxes', or choose a posterior-only uncertainty method."
+            )
+        scores = as_vector("objectness", objectness)
+        boxes = as_matrix("boxes_cxcywh", boxes_cxcywh)
+        if boxes.shape[1] != 4:
+            raise ValueError("boxes_cxcywh must have four columns.")
+        if boxes.shape[0] != scores.shape[0]:
+            raise ValueError("objectness must be parallel to boxes_cxcywh.")
+        # sqrt of the normalised area, so the term is a linear box *scale* rather
+        # than an area; areas span four orders of magnitude on real proposals and
+        # would make the product a pure area ranking.
+        scale = np.sqrt(np.clip(boxes[:, 2] * boxes[:, 3], 0.0, 1.0))
+        from daowod.normalisation import normalise
+
+        return np.sqrt(normalise(scores, "rank") * normalise(scale, "rank"))
+
     if method == "legacy_prob_score":
         if confidence is None:
             raise ValueError("legacy_prob_score requires confidence values.")
@@ -174,12 +222,35 @@ def compute_uncertainty(
     return 1.0 - (ordered[:, -1] - ordered[:, -2])
 
 
-def compute_novelty(candidate_embeddings: ArrayLike, reference_embeddings: ArrayLike) -> FloatArray:
+#: Similarity-matrix elements held in memory at once by :func:`compute_novelty`.
+#: 16 M float64 elements is 128 MB, which fits a Colab CPU runtime alongside a
+#: 400 k-proposal export. The unchunked expression ``candidates @ references.T``
+#: allocates ``N * R`` elements: at N = 70 000 and R = 20 000 that is 11.2 GB and
+#: the process is killed, so the chunk bound is a correctness requirement at real
+#: pool sizes, not a micro-optimisation.
+NOVELTY_CHUNK_ELEMENTS = 16_000_000
+
+
+def compute_novelty(
+    candidate_embeddings: ArrayLike,
+    reference_embeddings: ArrayLike,
+    *,
+    chunk_elements: int = NOVELTY_CHUNK_ELEMENTS,
+) -> FloatArray:
     """Raw cosine distance from the nearest labelled reference proposal.
 
     Unlike the legacy ``daowod.acquisition.compute_novelty`` this returns the
     *raw* distance; normalisation is the scorer's responsibility so that every
     component is treated identically (S6).
+
+    The nearest-reference search is blocked over candidate rows and only the
+    running maximum similarity is kept, so peak memory is bounded by
+    ``chunk_elements`` regardless of pool or bank size. ``max`` over a partitioned
+    axis is exact, so blocking is mathematically equivalent to the unblocked form;
+    the two can still differ in the last floating-point digit, because BLAS sums a
+    tall block and a single row in different orders. That is irrelevant to
+    selection — every component is rank-normalised — and it does not affect
+    determinism, since a given call always takes the same path.
     """
 
     candidates = normalise_rows(candidate_embeddings)
@@ -190,7 +261,15 @@ def compute_novelty(candidate_embeddings: ArrayLike, reference_embeddings: Array
         return np.empty(0, dtype=np.float64)
     if references.shape[0] == 0:
         return np.ones(candidates.shape[0], dtype=np.float64)
-    return 1.0 - (candidates @ references.T).max(axis=1)
+    if chunk_elements < 1:
+        raise ValueError("chunk_elements must be positive.")
+
+    rows_per_chunk = max(1, int(chunk_elements) // max(references.shape[0], 1))
+    best = np.empty(candidates.shape[0], dtype=np.float64)
+    for start in range(0, candidates.shape[0], rows_per_chunk):
+        stop = min(start + rows_per_chunk, candidates.shape[0])
+        best[start:stop] = (candidates[start:stop] @ references.T).max(axis=1)
+    return 1.0 - best
 
 
 def assign_pseudo_labels(
@@ -299,6 +378,8 @@ def compute_coherence(
     singleton_coherence: float = 0.0,
     minimum_cluster_size: int = 3,
     isolation_quantile: float = 0.9,
+    radius_quantile: float = 0.1,
+    minimum_samples: int = 4,
 ) -> CoherenceResult:
     """Local structural support for each proposal.
 
@@ -314,6 +395,13 @@ def compute_coherence(
     being small.
 
     ``density`` is the legacy absolute measure ``1 / (1 + d_k / median(d_k))``.
+
+    ``radius_core`` is the plan's second candidate definition: the number of
+    neighbours inside an epsilon ball, scaled by DBSCAN's ``min_samples``, so a
+    core point scores 1.0 and a noise point ~0. It needs no pseudo-labels, which
+    makes it the one coherence measure immune to clustering instability — the
+    defect ``docs/scientific_validation.md`` identifies as dominating the gate's
+    signal (clustering noise 0.317 versus gate signal 0.294).
 
     Clusters of size one have no internal structure at all; they receive
     ``singleton_coherence`` (0.0 by default, i.e. "an isolated proposal is not
@@ -357,6 +445,40 @@ def compute_coherence(
                 "scale": scale,
                 "note": "legacy absolute density; frequency-confounded (S5)",
                 "isolation_threshold": isolation_threshold,
+            },
+        )
+
+    if method == "radius_core":
+        # DBSCAN's core-point criterion, made continuous. eps is a quantile of the
+        # observed k-th neighbour distances rather than an absolute number,
+        # because a fixed eps in a 256-d cosine space is meaningless across pools
+        # and would silently become "everything is isolated" on a different
+        # checkpoint. A proposal reaching min_samples neighbours inside eps scores
+        # 1.0 (a DBSCAN core point); a lone proposal scores ~0.
+        radius = float(np.quantile(global_kth, radius_quantile))
+        radius = max(radius, 1e-12)
+        counts = np.asarray(
+            NearestNeighbors(radius=radius)
+            .fit(vectors)
+            .radius_neighbors(vectors, return_distance=False),
+            dtype=object,
+        )
+        # radius_neighbors includes the point itself; subtract it.
+        neighbours = np.array([max(len(item) - 1, 0) for item in counts], dtype=np.float64)
+        required = float(max(minimum_samples - 1, 1))
+        coherence = np.clip(neighbours / required, 0.0, 1.0)
+        return CoherenceResult(
+            coherence,
+            neighbours < required,
+            global_kth,
+            method,
+            {
+                "radius": radius,
+                "radius_quantile": radius_quantile,
+                "minimum_samples": minimum_samples,
+                "core_points": int((neighbours >= required).sum()),
+                "mean_neighbours_in_radius": float(neighbours.mean()),
+                "isolation_rule": "fewer than minimum_samples-1 neighbours within eps",
             },
         )
 
