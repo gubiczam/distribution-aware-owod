@@ -803,7 +803,7 @@ def leakage_check(
        checked by introspection rather than by trust, so the *only* way ground
        truth could enter is through the pool arrays;
     3. the pool arrays handed to the scorer carry no ``gt_`` field, checked by the
-       repository's existing :func:`daowod.diagnostics.assert_no_ground_truth`.
+       repository's existing :func:`daowod.oracle.assert_no_ground_truth`.
     """
 
     spec = _resolve(strategy)
@@ -825,7 +825,7 @@ def leakage_check(
 
     import inspect
 
-    from daowod.diagnostics import assert_no_ground_truth
+    from daowod.oracle import assert_no_ground_truth
 
     signature = inspect.signature(score_round)
     oracle_parameters = sorted(

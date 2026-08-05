@@ -1,7 +1,7 @@
 """Proposal-level oracle: what object, if any, does a PROB proposal sit on?
 
 The library previously joined ground truth only at *image* level
-(:func:`daowod.diagnostics.join_ground_truth` says so in its own docstring: "a
+(the old image-level join said so in its own docstring: "a
 proposal's box is not matched to an object here"). Every real-data claim in
 ``docs/`` therefore reduces to "the selected image contained a tail class
 somewhere", which cannot distinguish an annotation spent on a tail object from
@@ -22,8 +22,11 @@ Leakage contract
 ----------------
 Nothing in this module may be called before or during scoring. The returned
 :class:`OracleTable` carries only ``gt_``-prefixed fields precisely so that
-:func:`daowod.diagnostics.assert_no_ground_truth` rejects it if it is ever
-handed to an acquisition-time artifact.
+:func:`assert_no_ground_truth`, defined at the bottom of this module, rejects it
+if it is ever handed to an acquisition-time artifact. The guard lives here rather
+than in a module of its own because it is the enforcement half of this module's
+own contract: the oracle is the only source of ground truth, so the assertion
+that ground truth has not leaked belongs beside it.
 """
 
 from __future__ import annotations
@@ -511,3 +514,50 @@ def assign_frequency_groups(
             f"Frequency grouping produced only {sorted(present)}; expected {list(GROUP_NAMES)}."
         )
     return ClassGroups.from_mapping(mapping, source=source)
+
+
+# --- leakage guard -----------------------------------------------------------
+#
+# Salvaged from the deleted `diagnostics` module, which was otherwise
+# synthetic-pool instrumentation. This is the automated half of the ground-truth
+# discipline documented in `docs/reproduction.md` section 3.
+
+#: Field names that may only ever appear in a *post hoc* artifact. Any `gt_`
+#: prefix is rejected too, so a new oracle field cannot silently bypass the guard
+#: by not being on this list.
+GROUND_TRUTH_FIELDS: tuple[str, ...] = (
+    "gt_class",
+    "gt_classes",
+    "gt_group",
+    "gt_unknown",
+    "ground_truth",
+    "true_class",
+    "label",
+)
+
+
+class LeakageError(AssertionError):
+    """Raised when an acquisition-time artifact contains ground truth."""
+
+
+def assert_no_ground_truth(rows: Sequence[Mapping[str, object]]) -> None:
+    """Reject acquisition-time records that carry oracle information.
+
+    Cheap and name-based: it proves that no ground-truth *field* reached the
+    artifact, not that the score is free of oracle influence. The strong check is
+    :func:`daowod.discovery.assert_selection_is_ground_truth_free`, which
+    re-derives every score from its recorded components and so constrains
+    arithmetic rather than naming. Both run in the pipeline.
+    """
+
+    if not rows:
+        return
+    present = sorted(set().union(*(set(row) for row in rows)))
+    offending = [
+        field for field in present if field in GROUND_TRUTH_FIELDS or field.startswith("gt_")
+    ]
+    if offending:
+        raise LeakageError(
+            f"Acquisition-time proposal records contain ground-truth fields {offending}. "
+            "Ground truth may only be joined after selection, in a post-hoc artifact."
+        )

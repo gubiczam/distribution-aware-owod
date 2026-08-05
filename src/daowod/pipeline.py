@@ -35,12 +35,41 @@ import numpy as np
 from numpy.typing import NDArray
 
 from daowod import annotation_study as study
-from daowod import discovery, export_cache, longtail, modes, plots, preflight, reporting, runtime
+from daowod import discovery, export_cache, longtail, modes, plots, preflight, reporting
+from daowod.active import run_campaign
 from daowod.annotation_study import PreparedPool, StudyConfig, StudyOutputs
 from daowod.groups import ClassGroups
+from daowod.longtail import resolve_budgets
 from daowod.modes import ExecutionMode
+from daowod.scoring import STRATEGY_REGISTRY
 
 Progress = Callable[[str], None]
+
+
+class RuntimeBudgetExceeded(RuntimeError):
+    """The projected cost exceeds the declared budget, so the run refuses to start.
+
+    This replaces an earlier mechanism that reacted to the same situation by
+    *shrinking the evaluation pool* until the projection fit. That silently changed
+    the protocol after the protocol had been declared: the reported denominators,
+    and therefore the meaning of every recall in the run, depended on how loaded the
+    machine happened to be. Refusing is the honest response — the caller chooses a
+    smaller mode or raises the budget explicitly, and either way the choice is
+    recorded in the config rather than inferred from a stopwatch.
+    """
+
+
+#: Empirical growth exponent of one acquisition cell in pool size. 1.0 would be
+#: k-means and novelty alone; the neighbour search pushes it above that.
+POOL_COST_EXPONENT = 1.15
+
+#: Bytes per exported proposal: a 256-d float32 embedding, a 20-d posterior, a box
+#: and the scalar columns, rounded up for NPZ overhead.
+EXPORT_BYTES_PER_PROPOSAL = 1_200
+
+#: Bytes per pooled proposal held in memory: the float64 embedding the acquisition
+#: works on, plus the component and oracle columns.
+POOL_BYTES_PER_PROPOSAL = 2_400
 
 #: Artifacts the run promises to produce; verified before it reports success.
 REQUIRED_ARTIFACTS: tuple[str, ...] = (
@@ -264,6 +293,189 @@ class PipelineResult:
 def _log(progress: Progress | None, message: str) -> None:
     if progress is not None:
         progress(message)
+
+
+# --- cost estimate: measure, report, refuse -----------------------------------
+
+
+def count_study_cells(mode: ExecutionMode) -> int:
+    """Cells in the main matrix: severities x strategies x seeds."""
+
+    return len(mode.imbalance_settings) * len(mode.strategies) * len(mode.seeds)
+
+
+def count_ablation_cells(mode: ExecutionMode, *, specs: int) -> int:
+    """Cells in the ablation grid, which runs on one severity only."""
+
+    return 0 if not mode.run_ablations else int(specs) * len(mode.ablation_seeds)
+
+
+def scale_cell_seconds(
+    seconds: float, *, measured_pool: int, target_pool: int, exponent: float = POOL_COST_EXPONENT
+) -> float:
+    """Predict a cell's cost at a different pool size."""
+
+    if measured_pool < 1 or target_pool < 1:
+        raise ValueError("Pool sizes must be positive.")
+    return float(seconds) * (float(target_pool) / float(measured_pool)) ** float(exponent)
+
+
+def measure_cell_seconds(
+    *,
+    prepared: PreparedPool,
+    reference_embeddings: NDArray[np.float64],
+    config: StudyConfig,
+    strategy: str = "v2:full",
+    seed: int = 0,
+) -> float:
+    """Time one real campaign on the real pool.
+
+    The gated strategy is timed because it is the most expensive — it is the only
+    one needing both the neighbour search and the gate — so the estimate is an
+    upper bound per cell rather than an average that under-counts the variant the
+    run exists to measure.
+    """
+
+    spec = STRATEGY_REGISTRY.resolve(strategy)
+    budgets = resolve_budgets(config.budgets, pool_size=prepared.size)
+    started = time.perf_counter()
+    run_campaign(
+        pool=prepared.pool,
+        spec=spec,
+        reference_embeddings=np.asarray(reference_embeddings, dtype=np.float64),
+        gt_class=prepared.table.gt_class,
+        gt_is_unknown=prepared.table.gt_is_unknown,
+        total_budget=max(budgets),
+        rounds=config.rounds,
+        seed=seed,
+        saturation_mode=config.saturation_mode,
+        saturation_strength=config.saturation_strength,
+        keep_round_components=True,
+    )
+    return time.perf_counter() - started
+
+
+@dataclass(frozen=True)
+class CostEstimate:
+    """Projected runtime, disk and memory, with the budget it is judged against.
+
+    Deterministic given its inputs, and it changes nothing: if the projection does
+    not fit, :meth:`enforce` raises. See :class:`RuntimeBudgetExceeded`.
+    """
+
+    mode_name: str
+    seconds_per_image: float
+    seconds_per_cell: float
+    measured_pool_size: int
+    study_cells: int
+    ablation_cells: int
+    export_seconds: float
+    study_seconds: float
+    ablation_seconds: float
+    overhead_seconds: float
+    budget_seconds: float
+    export_disk_bytes: int
+    pool_memory_bytes: int
+    evaluation_images: int
+    per_image_limit: int
+    seeds: tuple[int, ...]
+
+    @property
+    def total_seconds(self) -> float:
+        return (
+            self.export_seconds + self.study_seconds + self.ablation_seconds + self.overhead_seconds
+        )
+
+    @property
+    def within_budget(self) -> bool:
+        return self.budget_seconds <= 0.0 or self.total_seconds <= self.budget_seconds
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "mode": self.mode_name,
+            "seconds_per_image": round(self.seconds_per_image, 4),
+            "seconds_per_cell": round(self.seconds_per_cell, 3),
+            "measured_pool_size": self.measured_pool_size,
+            "study_cells": self.study_cells,
+            "ablation_cells": self.ablation_cells,
+            "export_seconds": round(self.export_seconds, 1),
+            "study_seconds": round(self.study_seconds, 1),
+            "ablation_seconds": round(self.ablation_seconds, 1),
+            "overhead_seconds": round(self.overhead_seconds, 1),
+            "total_seconds": round(self.total_seconds, 1),
+            "total_hours": round(self.total_seconds / 3600.0, 2),
+            "budget_seconds": round(self.budget_seconds, 1),
+            "budget_hours": round(self.budget_seconds / 3600.0, 2),
+            "within_budget": self.within_budget,
+            "export_disk_gb": round(self.export_disk_bytes / 1e9, 2),
+            "pool_memory_gb": round(self.pool_memory_bytes / 1e9, 2),
+            "evaluation_images": self.evaluation_images,
+            "per_image_limit": self.per_image_limit,
+            "seeds": list(self.seeds),
+        }
+
+    def report(self) -> str:
+        return (
+            f"projected {self.total_seconds / 3600:.2f} h "
+            f"(export {self.export_seconds / 3600:.2f} h, study {self.study_seconds / 3600:.2f} h, "
+            f"ablations {self.ablation_seconds / 3600:.2f} h) "
+            f"against a budget of {self.budget_seconds / 3600:.2f} h; "
+            f"export disk ~{self.export_disk_bytes / 1e9:.2f} GB, "
+            f"pool memory ~{self.pool_memory_bytes / 1e9:.2f} GB"
+        )
+
+    def enforce(self) -> None:
+        """Raise unless the projection fits the declared budget."""
+
+        if self.within_budget:
+            return
+        raise RuntimeBudgetExceeded(
+            f"{self.report()}. The run refuses to start rather than shrink the "
+            "evaluation pool, because that would change the protocol after it was "
+            "declared. Choose a smaller mode, or raise the runtime budget "
+            "deliberately."
+        )
+
+
+def estimate_cost(
+    *,
+    mode: ExecutionMode,
+    seconds_per_image: float,
+    seconds_per_cell: float,
+    measured_pool_size: int,
+    ablation_specs: int,
+    images_already_exported: int = 0,
+    overhead_seconds: float = 0.0,
+    budget_seconds: float = 0.0,
+) -> CostEstimate:
+    """Project the whole run from two measured rates. Changes nothing."""
+
+    target_pool = max(mode.evaluation_images * mode.per_image_limit, 1)
+    per_cell = scale_cell_seconds(
+        seconds_per_cell, measured_pool=max(measured_pool_size, 1), target_pool=target_pool
+    )
+    study_cells = count_study_cells(mode)
+    ablation_cells = count_ablation_cells(mode, specs=ablation_specs)
+    images_to_export = max(mode.total_images - int(images_already_exported), 0)
+    proposals = mode.total_images * mode.per_image_limit
+    return CostEstimate(
+        mode_name=mode.name,
+        seconds_per_image=float(seconds_per_image),
+        seconds_per_cell=float(seconds_per_cell),
+        measured_pool_size=int(measured_pool_size),
+        study_cells=study_cells,
+        ablation_cells=ablation_cells,
+        export_seconds=float(seconds_per_image) * images_to_export,
+        study_seconds=per_cell * study_cells,
+        ablation_seconds=per_cell * ablation_cells,
+        overhead_seconds=float(overhead_seconds),
+        budget_seconds=float(budget_seconds),
+        export_disk_bytes=proposals * EXPORT_BYTES_PER_PROPOSAL,
+        pool_memory_bytes=target_pool * POOL_BYTES_PER_PROPOSAL,
+        evaluation_images=mode.evaluation_images,
+        per_image_limit=mode.per_image_limit,
+        seeds=tuple(mode.seeds),
+    )
 
 
 def stage_preflight(config: PipelineConfig, mode: ExecutionMode) -> list[preflight.Check]:
@@ -706,39 +918,25 @@ def run_pipeline(
         config, image_ids=splits["evaluation"], progress=progress
     )
     if seconds_per_image is not None:
-        # Only the export term is known at this point, so the projection uses the
-        # export budget alone. A pool that cannot even be inferred inside the
-        # budget must shrink before the GPU is committed; the study term is
-        # measured on the real pool later and can only shrink things further.
-        export_only = runtime.project(
+        # Only the export term is known at this point, so it is judged against the
+        # export half of the budget. Checking here means a pool that cannot even be
+        # inferred in time fails before any GPU hour is committed, rather than three
+        # hours in.
+        export_only = estimate_cost(
             mode=mode,
             seconds_per_image=seconds_per_image,
             seconds_per_cell=0.0,
             measured_pool_size=max(mode.evaluation_images * mode.per_image_limit, 1),
             ablation_specs=0,
-            overhead_seconds=0.0,
             budget_seconds=mode.runtime_budget_seconds * 0.5,
         )
         _log(
             progress,
             f"  {seconds_per_image:.2f}s/image; exporting {mode.total_images} images "
-            f"projects {export_only.export_seconds / 3600:.2f} h",
+            f"projects {export_only.export_seconds / 3600:.2f} h; "
+            f"export disk ~{export_only.export_disk_bytes / 1e9:.2f} GB",
         )
-        if not export_only.within_budget:
-            factor = (mode.runtime_budget_seconds * 0.5) / max(export_only.export_seconds, 1e-9)
-            images = max(runtime.MINIMUM_EVALUATION_IMAGES, int(mode.evaluation_images * factor))
-            _log(
-                progress,
-                f"  export alone would exceed half the budget; reducing evaluation "
-                f"images {mode.evaluation_images} -> {images}",
-            )
-            mode = modes.scaled(
-                mode,
-                evaluation_images=images,
-                pilot_images=int(mode.pilot_images * factor),
-            )
-            result.mode = mode
-            splits = stage_splits(config, mode, available_ids=available)
+        export_only.enforce()
     state.save(f"splits_{config.fingerprint()}", dict(splits))
     result.stage_seconds["probe"] = round(time.time() - stage_started, 1)
 
@@ -830,54 +1028,29 @@ def run_pipeline(
         _log(progress, "  skipped: this mode runs no pilot")
     result.stage_seconds["pilot"] = round(time.time() - stage_started, 1)
 
-    _log(progress, "[9/11] Runtime projection")
+    _log(progress, "[9/11] Cost estimate")
     stage_started = time.time()
-    cell_timing = runtime.measure_cell_seconds(
+    seconds_per_cell = measure_cell_seconds(
         prepared=evaluation, reference_embeddings=bank, config=base_study
     )
-    # The export is already paid for, so the remaining work is projected against
-    # the *remaining* budget. Comparing it against the full budget would let a run
-    # that spent three hours on inference still claim its four-hour matrix fits.
-    # The floor keeps an over-running session from shrinking to nothing: at that
-    # point the honest answer is a smaller mode, which fit_to_budget raises for.
-    remaining_budget = max(600.0, mode.runtime_budget_seconds - (time.time() - started))
-    plan = runtime.fit_to_budget(
+    # The export is already paid for, so the remaining work is judged against the
+    # *remaining* budget. Comparing it against the full budget would let a run that
+    # spent three hours on inference still claim its four-hour matrix fits.
+    remaining_budget = max(0.0, mode.runtime_budget_seconds - (time.time() - started))
+    estimate = estimate_cost(
         mode=mode,
         seconds_per_image=float(export_report.get("seconds_per_image") or 0.0),
-        seconds_per_cell=cell_timing.seconds,
+        seconds_per_cell=seconds_per_cell,
         measured_pool_size=evaluation.size,
         ablation_specs=len(study.ablation_specs()),
         images_already_exported=len(requested),
         budget_seconds=remaining_budget,
     )
-    result.runtime_plan = plan.as_dict()
+    result.runtime_plan = estimate.as_dict()
     reporting.write_json(output_dir / "runtime_plan.json", result.runtime_plan)
-    _log(
-        progress,
-        f"  one cell {cell_timing.seconds:.1f}s at pool {evaluation.size}; "
-        f"projected total {plan.total_seconds / 3600:.2f} h "
-        f"(budget {plan.budget_seconds / 3600:.2f} h)",
-    )
-    if plan.actions:
-        _log(progress, "  downscaled: " + "; ".join(plan.actions))
-        mode = plan.mode
-        result.mode = mode
-        splits = stage_splits(config, mode, available_ids=available)
-        evaluation, pilot, bank, groups = stage_pools(config, mode, export=export, splits=splits)
-        result.pool_report = dict(evaluation.pool_report)
-        result.composition = dict(evaluation.composition)
-        mode, result.severity_rows, result.severity_verdict = stage_severities(
-            config, mode, prepared=evaluation
-        )
-        base_study = replace(
-            base_study,
-            budgets=tuple(mode.budgets),
-            rounds=mode.rounds,
-            seeds=tuple(mode.seeds),
-            imbalance_settings=tuple(mode.imbalance_settings),
-            candidate_spec=mode.study_config().candidate_spec,
-        )
-        _log(progress, f"  resized pool: {evaluation.size} proposals")
+    _log(progress, f"  one cell {seconds_per_cell:.1f}s at pool {evaluation.size}")
+    _log(progress, f"  {estimate.report()}")
+    estimate.enforce()
     result.stage_seconds["runtime_plan"] = round(time.time() - stage_started, 1)
 
     _log(progress, "[10/11] Main study matrix")

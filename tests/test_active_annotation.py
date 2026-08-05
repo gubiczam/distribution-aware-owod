@@ -29,9 +29,9 @@ from daowod import (
     longtail,
     modes,
     oracle,
+    pipeline,
     plots,
     reporting,
-    runtime,
 )
 from daowod.components import compute_novelty
 from daowod.groups import ClassGroups
@@ -580,39 +580,68 @@ def test_main_mode_targets_the_five_required_strategies() -> None:
     assert mode.research_grade is True
 
 
-def test_runtime_projection_shrinks_the_pool_not_the_design() -> None:
+def test_a_fitting_estimate_reports_runtime_disk_and_memory() -> None:
     mode = modes.resolve_mode("MAIN")
-    plan = runtime.fit_to_budget(
+    estimate = pipeline.estimate_cost(
         mode=mode,
-        seconds_per_image=0.01,
-        seconds_per_cell=60.0,
+        seconds_per_image=0.001,
+        seconds_per_cell=0.5,
         measured_pool_size=mode.evaluation_images * mode.per_image_limit,
         ablation_specs=18,
-        budget_seconds=1800.0,
+        budget_seconds=36_000.0,
     )
-    assert plan.within_budget
-    assert plan.actions
-    assert plan.mode.evaluation_images < mode.evaluation_images
-    # The comparison itself is untouched.
-    assert plan.mode.seeds == mode.seeds
-    assert plan.mode.strategies == mode.strategies
-    assert plan.mode.imbalance_settings == mode.imbalance_settings
+    assert estimate.within_budget
+    estimate.enforce()  # must not raise
+    payload = estimate.as_dict()
+    assert payload["study_cells"] == (
+        len(mode.imbalance_settings) * len(mode.strategies) * len(mode.seeds)
+    )
+    # D3: runtime is not the only declared limit.
+    assert payload["export_disk_gb"] > 0.0
+    assert payload["pool_memory_gb"] > 0.0
 
 
-def test_an_impossible_budget_raises_instead_of_reducing_the_design() -> None:
-    with pytest.raises(runtime.RuntimeBudgetError, match="deliberately not reduced"):
-        runtime.fit_to_budget(
-            mode=modes.resolve_mode("MAIN"),
-            seconds_per_image=1.0,
-            seconds_per_cell=1e5,
-            measured_pool_size=1000,
-            ablation_specs=18,
-            budget_seconds=60.0,
-        )
+def test_an_over_budget_estimate_refuses_and_never_shrinks_the_pool() -> None:
+    """The protocol must not change because the machine was slow.
+
+    An earlier version reacted to this case by reducing the evaluation pool until
+    the projection fit, which silently moved every reported denominator. The
+    estimate is now inert: it reports and refuses.
+    """
+
+    mode = modes.resolve_mode("MAIN")
+    estimate = pipeline.estimate_cost(
+        mode=mode,
+        seconds_per_image=1.0,
+        seconds_per_cell=1e5,
+        measured_pool_size=1000,
+        ablation_specs=18,
+        budget_seconds=60.0,
+    )
+    assert not estimate.within_budget
+    with pytest.raises(pipeline.RuntimeBudgetExceeded, match="refuses to start"):
+        estimate.enforce()
+    # The design it was asked about is untouched.
+    assert estimate.evaluation_images == mode.evaluation_images
+    assert estimate.per_image_limit == mode.per_image_limit
+    assert estimate.seeds == tuple(mode.seeds)
+
+
+def test_a_zero_budget_means_unbounded_rather_than_impossible() -> None:
+    estimate = pipeline.estimate_cost(
+        mode=modes.resolve_mode("MAIN"),
+        seconds_per_image=1.0,
+        seconds_per_cell=1e6,
+        measured_pool_size=1000,
+        ablation_specs=18,
+        budget_seconds=0.0,
+    )
+    assert estimate.within_budget
+    estimate.enforce()
 
 
 def test_cell_cost_scales_superlinearly_in_pool_size() -> None:
-    doubled = runtime.scale_cell_seconds(10.0, measured_pool=1000, target_pool=2000)
+    doubled = pipeline.scale_cell_seconds(10.0, measured_pool=1000, target_pool=2000)
     assert doubled > 20.0
 
 

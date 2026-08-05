@@ -522,7 +522,7 @@ def assert_selection_is_ground_truth_free(
 
     A ground-truth term smuggled into the acquisition score would make the
     recorded components fail to reproduce the score. This is a stronger check
-    than :func:`daowod.diagnostics.assert_no_ground_truth`, which only inspects
+    than :func:`daowod.oracle.assert_no_ground_truth`, which only inspects
     column *names*.
     """
 
