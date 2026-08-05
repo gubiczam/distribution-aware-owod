@@ -384,7 +384,7 @@ def make_pool(count: int = 40, dimensions: int = 8) -> active.ProposalPool:
 
 def test_annotated_proposals_can_never_be_selected_twice() -> None:
     pool = make_pool()
-    spec = annotation_study.STRATEGY_REGISTRY.resolve("v2:full")
+    spec = annotation_study.STRATEGY_REGISTRY.resolve("full")
     state = active.initial_state(pool_size=pool.size, reference_embeddings=pool.embeddings[:5])
     first = active.score_round(pool=pool, spec=spec, state=state, seed=0)
     chosen = active.select_batch(first.scores, batch_size=5, proposal_ids=pool.proposal_ids)
@@ -432,7 +432,7 @@ def test_every_round_verifies_its_own_score_against_its_components(monkeypatch) 
     """The leakage identity is checked per round, not once per run."""
 
     pool = make_pool()
-    spec = annotation_study.STRATEGY_REGISTRY.resolve("v2:full")
+    spec = annotation_study.STRATEGY_REGISTRY.resolve("full")
     state = active.initial_state(pool_size=pool.size, reference_embeddings=pool.embeddings[:5])
 
     calls: list[int] = []
@@ -463,7 +463,7 @@ def test_selection_is_deterministic_and_breaks_ties_by_proposal_id() -> None:
 
 def test_campaign_order_is_a_prefix_chain() -> None:
     pool = make_pool()
-    spec = annotation_study.STRATEGY_REGISTRY.resolve("v2:full")
+    spec = annotation_study.STRATEGY_REGISTRY.resolve("full")
     result = active.run_campaign(
         pool=pool,
         spec=spec,
@@ -701,10 +701,10 @@ def test_chunking_is_deterministic_and_deduplicated() -> None:
 
 def test_paired_contrasts_are_computed_per_seed() -> None:
     auc_rows = [
-        {"strategy": "v2:full", "seed": 0, "imbalance_setting": "n", "tail_discovery_auc": 0.5},
-        {"strategy": "v2:random", "seed": 0, "imbalance_setting": "n", "tail_discovery_auc": 0.2},
-        {"strategy": "v2:full", "seed": 1, "imbalance_setting": "n", "tail_discovery_auc": 0.6},
-        {"strategy": "v2:random", "seed": 1, "imbalance_setting": "n", "tail_discovery_auc": 0.1},
+        {"strategy": "full", "seed": 0, "imbalance_setting": "n", "tail_discovery_auc": 0.5},
+        {"strategy": "random", "seed": 0, "imbalance_setting": "n", "tail_discovery_auc": 0.2},
+        {"strategy": "full", "seed": 1, "imbalance_setting": "n", "tail_discovery_auc": 0.6},
+        {"strategy": "random", "seed": 1, "imbalance_setting": "n", "tail_discovery_auc": 0.1},
     ]
     contrasts = reporting.headline_contrasts(auc_rows)
     row = next(item for item in contrasts if item["comparison"] == "gate vs random")
@@ -830,7 +830,7 @@ def test_dataset_staging_names_the_missing_file(tmp_path: Path) -> None:
 
 def _coherence_rows(tail: float, background: float) -> list[dict[str, object]]:
     return [
-        {"strategy": "v2:full", "component": "coherence", "stratum": stratum, "median": median}
+        {"strategy": "full", "component": "coherence", "stratum": stratum, "median": median}
         for stratum, median in (
             ("true_tail", tail),
             ("true_head", 0.46),

@@ -193,7 +193,7 @@ def test_all_rarity_methods_agree_under_rank_normalisation() -> None:
 def test_gate_promotes_rare_and_coherent_over_rare_and_isolated() -> None:
     """The whole point of Contribution A, tested directly."""
 
-    spec = STRATEGY_REGISTRY.resolve("v2:rarity_coherence")
+    spec = STRATEGY_REGISTRY.resolve("rarity_coherence")
     result = score_pool(
         spec=spec,
         image_ids=IMAGE_IDS,
@@ -205,7 +205,7 @@ def test_gate_promotes_rare_and_coherent_over_rare_and_isolated() -> None:
     )
     # Use the true partition so the test isolates the gate, not KMeans.
     scored = score_pool(
-        spec=STRATEGY_REGISTRY.resolve("v2:rarity_coherence").__class__(
+        spec=STRATEGY_REGISTRY.resolve("rarity_coherence").__class__(
             **{**spec.as_dict(), "pseudo_label_source": "predicted"}
         ),
         image_ids=IMAGE_IDS,
@@ -232,7 +232,7 @@ def test_gate_promotes_rare_and_coherent_over_rare_and_isolated() -> None:
 
 
 def test_frequent_and_isolated_is_not_promoted() -> None:
-    spec = STRATEGY_REGISTRY.resolve("v2:full")
+    spec = STRATEGY_REGISTRY.resolve("full")
     result = score_pool(
         spec=spec.__class__(**{**spec.as_dict(), "pseudo_label_source": "predicted"}),
         image_ids=IMAGE_IDS,

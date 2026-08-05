@@ -337,7 +337,7 @@ def test_the_candidate_pool_is_identical_after_substitution(tmp_path) -> None:
         spec=spec,
     )
     assert original.indices.tolist() == after.indices.tolist()
-    assert annotation_study.STRATEGY_FAMILY["v2:full"] == "baseline"  # baseline untouched
+    assert annotation_study.STRATEGY_FAMILY["full"] == "baseline"  # baseline untouched
 
 
 # --------------------------------------------------------------------------

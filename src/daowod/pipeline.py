@@ -325,7 +325,7 @@ def measure_cell_seconds(
     prepared: PreparedPool,
     reference_embeddings: NDArray[np.float64],
     config: StudyConfig,
-    strategy: str = "v2:full",
+    strategy: str = "full",
     seed: int = 0,
 ) -> float:
     """Time one real campaign on the real pool.

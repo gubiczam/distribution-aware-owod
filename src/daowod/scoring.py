@@ -1,26 +1,23 @@
 """The one canonical acquisition scorer and the one strategy registry.
 
-Everything — the live campaign, offline analysis, simulations, notebook
-diagnostics, ablations and tests — scores proposals through :func:`score_pool`.
-The audit found the scoring formula duplicated in four places and already
-drifted (``uncertainty_novelty`` was weight-normalised online and un-normalised
-offline); representing strategies as declarative specs removes the possibility.
+Everything — the annotation study, the component audit, the representation
+experiment, ablations and tests — scores proposals through :func:`score_pool`. An
+audit once found this formula duplicated in four places and already drifted
+(``uncertainty_novelty`` was weight-normalised in one copy and not in another);
+representing strategies as declarative specs removes the possibility.
 
-Canonical score
----------------
+Canonical score, the proposal's equation (1)
+--------------------------------------------
     S = w_u * U_hat + w_n * N_hat + w_r * R_hat + w_g * G_hat + w_c * C_hat
 
-``G_hat`` is the normalised gated interaction ``normalise(R_hat * coherence**p)``.
-``w_c`` extends the specified form so that a pure ``coherence`` baseline is
-expressible; with ``w_c = 0`` the score reduces exactly to the specified one.
+``G_hat`` is the normalised gated interaction ``normalise(R_hat * coherence**p)``
+— the AND relation between rarity and local coherence that the proposal calls
+indispensable. ``w_c`` extends the specified form so that a pure ``coherence``
+baseline is expressible; with ``w_c = 0`` the score reduces exactly to equation (1).
 
-Semantics versions
-------------------
-Version 2 is the current science: posterior entropy, rank normalisation,
-scale-free coherence. Version 1 reproduces the pre-audit behaviour bit for bit
-and exists so published numbers remain reproducible. A name that exists in both
-versions must be requested with an explicit ``semantics_version`` — nothing is
-silently reinterpreted.
+Current science: posterior entropy for uncertainty, rank normalisation, and
+scale-free within-cluster coherence. There is one semantics, so strategy names are
+plain — ``full``, not ``full``. See :class:`StrategyRegistry`.
 """
 
 from collections.abc import Hashable, Mapping, Sequence
@@ -71,7 +68,6 @@ class StrategySpec:
     """A complete, declarative description of one acquisition strategy."""
 
     name: str
-    semantics_version: int = 2
     uncertainty_weight: float = 0.0
     novelty_weight: float = 0.0
     rarity_weight: float = 0.0
@@ -96,18 +92,12 @@ class StrategySpec:
     support_neighbours: int = 5
     image_aggregation: str = "top_k_mean"
     top_k: int = 3
-    weight_normalise: bool = False
     random_selection: bool = False
-    deprecated: str = ""
     description: str = ""
 
     def __post_init__(self) -> None:
         if not self.name:
             raise StrategyError("A strategy must have a name.")
-        if self.semantics_version not in (1, 2):
-            raise StrategyError(
-                f"{self.name}: semantics_version must be 1 or 2, got {self.semantics_version}."
-            )
         weights = self.weights()
         if any(value < 0 for value in weights.values()):
             raise StrategyError(f"{self.name}: weights must be non-negative.")
@@ -214,14 +204,12 @@ class StrategySpec:
             self.support_neighbours,
             self.image_aggregation,
             self.top_k,
-            self.weight_normalise,
             self.random_selection,
         )
 
     def as_dict(self) -> dict[str, object]:
         return {
             "name": self.name,
-            "semantics_version": self.semantics_version,
             "uncertainty_weight": self.uncertainty_weight,
             "novelty_weight": self.novelty_weight,
             "rarity_weight": self.rarity_weight,
@@ -246,126 +234,16 @@ class StrategySpec:
             "support_neighbours": self.support_neighbours,
             "image_aggregation": self.image_aggregation,
             "top_k": self.top_k,
-            "weight_normalise": self.weight_normalise,
             "random_selection": self.random_selection,
-            "deprecated": self.deprecated,
             "description": self.description,
         }
 
 
-# --- version 1: exact pre-audit semantics, preserved for reproducibility -----
-# uncertainty and coherence were unnormalised, novelty and rarity min-maxed.
-_LEGACY_NORMALISATION: dict[str, str] = {
-    "uncertainty": "none",
-    "novelty": "minmax",
-    "rarity": "minmax",
-    "coherence": "none",
-    "gated": "none",
-}
-_LEGACY_COMMON: dict[str, object] = {
-    "semantics_version": 1,
-    "uncertainty_method": "legacy_prob_score",
-    "rarity_method": "inverse_frequency",
-    "coherence_method": "density",
-    "normalisation": "minmax",
-    "component_normalisation": _LEGACY_NORMALISATION,
-    "pseudo_label_source": "cluster",
-    "cluster_count": 20,
-    "neighbour_count": 5,
-    "image_aggregation": "top_k_mean",
-    "top_k": 3,
-}
-_LEGACY_ALPHA, _LEGACY_BETA, _LEGACY_GAMMA = 0.3, 0.2, 0.5
+# --- the strategy registry ---------------------------------------------------
+#: The reported weights for equation (1): alpha, beta, gamma.
+ALPHA, BETA, GAMMA = 0.3, 0.2, 0.5
 
-_VERSION_1: tuple[StrategySpec, ...] = (
-    StrategySpec(
-        name="random",
-        semantics_version=1,
-        random_selection=True,
-        description="Uniform random image selection (identical in both versions).",
-    ),
-    StrategySpec(
-        name="uncertainty",
-        uncertainty_weight=1.0,
-        deprecated="1 - |2c - 1| is a monotone rescaling of the PROB unknown "
-        "score (audit S2); use semantics_version 2 'uncertainty'.",
-        description="Legacy: raw ambiguity of the unknown score.",
-        **_LEGACY_COMMON,
-    ),
-    StrategySpec(
-        name="uncertainty_novelty",
-        uncertainty_weight=_LEGACY_ALPHA,
-        novelty_weight=_LEGACY_BETA,
-        weight_normalise=True,
-        deprecated="Weight normalisation differed between the online and "
-        "offline implementations before the audit.",
-        description="Legacy: (alpha*u + beta*n) / (alpha + beta).",
-        **_LEGACY_COMMON,
-    ),
-    StrategySpec(
-        name="rarity",
-        rarity_weight=1.0,
-        deprecated="count**-1 after min-max is a near-binary singleton indicator (audit S4).",
-        description="Legacy: min-maxed inverse pseudo-class frequency.",
-        **_LEGACY_COMMON,
-    ),
-    StrategySpec(
-        name="rarity_coherence",
-        gated_weight=1.0,
-        coherence_exponent=1.0,
-        deprecated="Absolute-density coherence is frequency-confounded (audit S5).",
-        description="Legacy: rarity * density_coherence.",
-        **_LEGACY_COMMON,
-    ),
-    StrategySpec(
-        name="ungated_full",
-        uncertainty_weight=_LEGACY_ALPHA,
-        novelty_weight=_LEGACY_BETA,
-        rarity_weight=_LEGACY_GAMMA,
-        description="Legacy: alpha*u + beta*n + gamma*r, no coherence gate.",
-        **_LEGACY_COMMON,
-    ),
-    StrategySpec(
-        name="rarity_no_coherence",
-        uncertainty_weight=_LEGACY_ALPHA,
-        novelty_weight=_LEGACY_BETA,
-        rarity_weight=_LEGACY_GAMMA,
-        description="Legacy alias of ungated_full used by the pilot campaign.",
-        **_LEGACY_COMMON,
-    ),
-    StrategySpec(
-        name="full",
-        uncertainty_weight=_LEGACY_ALPHA,
-        novelty_weight=_LEGACY_BETA,
-        gated_weight=_LEGACY_GAMMA,
-        coherence_exponent=1.0,
-        description="Legacy: alpha*u + beta*n + gamma*r*coherence**1.",
-        **_LEGACY_COMMON,
-    ),
-    StrategySpec(
-        name="full_p1",
-        uncertainty_weight=_LEGACY_ALPHA,
-        novelty_weight=_LEGACY_BETA,
-        gated_weight=_LEGACY_GAMMA,
-        coherence_exponent=1.0,
-        description="Pilot variant full_p1: legacy full with p = 1.0.",
-        **_LEGACY_COMMON,
-    ),
-    StrategySpec(
-        name="full_p05",
-        uncertainty_weight=_LEGACY_ALPHA,
-        novelty_weight=_LEGACY_BETA,
-        gated_weight=_LEGACY_GAMMA,
-        coherence_exponent=0.5,
-        description="Pilot variant full_p05: legacy full with p = 0.5.",
-        **_LEGACY_COMMON,
-    ),
-)
-
-# --- version 2: post-audit semantics ----------------------------------------
-_V2_ALPHA, _V2_BETA, _V2_GAMMA = 0.3, 0.2, 0.5
-
-_VERSION_2: tuple[StrategySpec, ...] = (
+_SPECS: tuple[StrategySpec, ...] = (
     StrategySpec(
         name="random",
         random_selection=True,
@@ -393,20 +271,20 @@ _VERSION_2: tuple[StrategySpec, ...] = (
     ),
     StrategySpec(
         name="uncertainty_novelty",
-        uncertainty_weight=_V2_ALPHA,
-        novelty_weight=_V2_BETA,
+        uncertainty_weight=ALPHA,
+        novelty_weight=BETA,
         description="Entropy + novelty.",
     ),
     StrategySpec(
         name="uncertainty_rarity",
-        uncertainty_weight=_V2_ALPHA,
-        rarity_weight=_V2_GAMMA,
+        uncertainty_weight=ALPHA,
+        rarity_weight=GAMMA,
         description="Entropy + rarity, no coherence gate.",
     ),
     StrategySpec(
         name="uncertainty_coherence",
-        uncertainty_weight=_V2_ALPHA,
-        coherence_weight=_V2_GAMMA,
+        uncertainty_weight=ALPHA,
+        coherence_weight=GAMMA,
         description="Entropy + coherence, no rarity.",
     ),
     StrategySpec(
@@ -422,43 +300,43 @@ _VERSION_2: tuple[StrategySpec, ...] = (
     ),
     StrategySpec(
         name="full",
-        uncertainty_weight=_V2_ALPHA,
-        novelty_weight=_V2_BETA,
-        gated_weight=_V2_GAMMA,
+        uncertainty_weight=ALPHA,
+        novelty_weight=BETA,
+        gated_weight=GAMMA,
         description="Contribution A: entropy + novelty + gated rarity.",
     ),
     StrategySpec(
         name="full_no_coherence",
-        uncertainty_weight=_V2_ALPHA,
-        novelty_weight=_V2_BETA,
-        rarity_weight=_V2_GAMMA,
+        uncertainty_weight=ALPHA,
+        novelty_weight=BETA,
+        rarity_weight=GAMMA,
         description="Full with the coherence gate removed (rarity ungated).",
     ),
     StrategySpec(
         name="full_no_rarity",
-        uncertainty_weight=_V2_ALPHA,
-        novelty_weight=_V2_BETA,
-        coherence_weight=_V2_GAMMA,
+        uncertainty_weight=ALPHA,
+        novelty_weight=BETA,
+        coherence_weight=GAMMA,
         description="Full with rarity removed, coherence kept additively.",
     ),
     StrategySpec(
         name="full_no_uncertainty",
-        novelty_weight=_V2_BETA,
-        gated_weight=_V2_GAMMA,
+        novelty_weight=BETA,
+        gated_weight=GAMMA,
         description="Full with the uncertainty term removed.",
     ),
     StrategySpec(
         name="full_no_novelty",
-        uncertainty_weight=_V2_ALPHA,
-        gated_weight=_V2_GAMMA,
+        uncertainty_weight=ALPHA,
+        gated_weight=GAMMA,
         description="Full with the novelty term removed; matches the written "
         "proposal S = U + gamma * w(c) * coh.",
     ),
     StrategySpec(
         name="proposal_formula",
         uncertainty_weight=1.0,
-        rarity_weight=_V2_GAMMA,
-        gated_weight=_V2_GAMMA,
+        rarity_weight=GAMMA,
+        gated_weight=GAMMA,
         description="The formula exactly as written in the research proposal: "
         "S = U + lambda*D + gamma*w(c)*coh, i.e. both an ungated and a gated "
         "distribution term.",
@@ -467,7 +345,7 @@ _VERSION_2: tuple[StrategySpec, ...] = (
     # The audit's control arm. Measured on the real Task-1 pool, objectness x box
     # scale reaches ROC-AUC 0.777 for unknown-versus-background where every
     # semantic component sits near 0.48, and a static sort by it finds 85 unknown
-    # objects in a 2 000-region budget against 16 for v2:full. A distribution-aware
+    # objects in a 2 000-region budget against 16 for full. A distribution-aware
     # method that does not beat this is not earning its complexity, so it is an arm
     # of the comparison rather than a remark in the discussion.
     StrategySpec(
@@ -479,9 +357,9 @@ _VERSION_2: tuple[StrategySpec, ...] = (
     ),
     StrategySpec(
         name="prior_full",
-        uncertainty_weight=_V2_ALPHA,
-        novelty_weight=_V2_BETA,
-        gated_weight=_V2_GAMMA,
+        uncertainty_weight=ALPHA,
+        novelty_weight=BETA,
+        gated_weight=GAMMA,
         uncertainty_method="objectness_area_prior",
         description="Contribution A's composition with the informativeness prior in "
         "the U slot: does distribution-awareness add anything on top of a prior "
@@ -489,16 +367,16 @@ _VERSION_2: tuple[StrategySpec, ...] = (
     ),
     StrategySpec(
         name="prior_revealed_full",
-        uncertainty_weight=_V2_ALPHA,
-        novelty_weight=_V2_BETA,
-        gated_weight=_V2_GAMMA,
+        uncertainty_weight=ALPHA,
+        novelty_weight=BETA,
+        gated_weight=GAMMA,
         uncertainty_method="objectness_area_prior",
         distribution_estimator="revealed",
         description="The informativeness prior plus the label-anchored "
         "distribution term: the strongest combination the audit motivates.",
     ),
     # --- label-anchored distribution estimation ------------------------------
-    # Same formula, same weights, same gate form as v2:full. The single changed
+    # Same formula, same weights, same gate form as full. The single changed
     # variable is where rarity and coherence come from: the regions the oracle has
     # already confirmed, rather than k-means over a pool that is 75 % background.
     # Motivated by the measured 0.35 ROC-AUC gap between what the decoder features
@@ -506,9 +384,9 @@ _VERSION_2: tuple[StrategySpec, ...] = (
     # (0.44-0.49); see daowod.revealed.
     StrategySpec(
         name="revealed_full",
-        uncertainty_weight=_V2_ALPHA,
-        novelty_weight=_V2_BETA,
-        gated_weight=_V2_GAMMA,
+        uncertainty_weight=ALPHA,
+        novelty_weight=BETA,
+        gated_weight=GAMMA,
         distribution_estimator="revealed",
         description="Contribution A with a label-anchored distribution term: "
         "entropy + novelty + gated (revealed-class rarity x revealed-unknown "
@@ -516,18 +394,18 @@ _VERSION_2: tuple[StrategySpec, ...] = (
     ),
     StrategySpec(
         name="revealed_no_gate",
-        uncertainty_weight=_V2_ALPHA,
-        novelty_weight=_V2_BETA,
-        rarity_weight=_V2_GAMMA,
+        uncertainty_weight=ALPHA,
+        novelty_weight=BETA,
+        rarity_weight=GAMMA,
         distribution_estimator="revealed",
         description="Label-anchored rarity without the support gate, isolating "
         "what the gate's form contributes once rarity is anchored.",
     ),
     StrategySpec(
         name="revealed_support_only",
-        uncertainty_weight=_V2_ALPHA,
-        novelty_weight=_V2_BETA,
-        coherence_weight=_V2_GAMMA,
+        uncertainty_weight=ALPHA,
+        novelty_weight=BETA,
+        coherence_weight=GAMMA,
         distribution_estimator="revealed",
         description="Revealed-unknown support with no rarity term, isolating how "
         "much of any gain is 'resembles a confirmed unknown' rather than "
@@ -537,107 +415,61 @@ _VERSION_2: tuple[StrategySpec, ...] = (
 
 
 class StrategyRegistry:
-    """The single authoritative source of strategy definitions."""
+    """The single authoritative source of strategy definitions.
+
+    One flat namespace, because equation (1) is one formula. An earlier version
+    carried two semantics versions side by side and required a ``v1:``/``v2:``
+    prefix to disambiguate; the pre-audit definitions it preserved reproduced
+    numbers from a pool later disqualified as a subset of the evaluation split, so
+    there was nothing publishable to reproduce. They are in git history at tag
+    ``pre-refactor-snapshot``, which is where a superseded definition belongs.
+    """
 
     def __init__(self, specs: Sequence[StrategySpec]) -> None:
-        self._by_version: dict[int, dict[str, StrategySpec]] = {1: {}, 2: {}}
+        self._specs: dict[str, StrategySpec] = {}
         for spec in specs:
-            bucket = self._by_version[spec.semantics_version]
-            if spec.name in bucket:
-                raise StrategyError(
-                    f"Duplicate strategy {spec.name!r} in semantics version "
-                    f"{spec.semantics_version}."
-                )
-            bucket[spec.name] = spec
+            if spec.name in self._specs:
+                raise StrategyError(f"Duplicate strategy {spec.name!r}.")
+            self._specs[spec.name] = spec
 
-    def names(self, semantics_version: int | None = None) -> list[str]:
-        if semantics_version is None:
-            return sorted({name for bucket in self._by_version.values() for name in bucket})
-        return sorted(self._by_version[semantics_version])
+    def names(self) -> list[str]:
+        return sorted(self._specs)
 
-    def qualified_names(self) -> list[str]:
-        return sorted(
-            f"v{version}:{name}" for version, bucket in self._by_version.items() for name in bucket
-        )
+    def resolve(self, name: str) -> StrategySpec:
+        """Look up a strategy by its plain name."""
 
-    def resolve(self, name: str, *, semantics_version: int | None = None) -> StrategySpec:
-        """Look up a strategy, refusing to guess which semantics were meant.
-
-        ``"v1:full"`` / ``"v2:full"`` prefixes are accepted so a config can pin
-        the version inline.
-        """
-
-        if ":" in name:
-            prefix, _, bare = name.partition(":")
-            if prefix not in ("v1", "v2"):
-                raise StrategyError(
-                    f"Unknown semantics prefix {prefix!r} in {name!r}; use 'v1:' or 'v2:'."
-                )
-            requested = int(prefix[1:])
-            if semantics_version is not None and semantics_version != requested:
-                raise StrategyError(
-                    f"{name!r} pins semantics version {requested} but "
-                    f"semantics_version={semantics_version} was requested."
-                )
-            return self.resolve(bare, semantics_version=requested)
-
-        if semantics_version is not None:
-            bucket = self._by_version.get(semantics_version)
-            if bucket is None:
-                raise StrategyError(f"Unknown semantics version: {semantics_version}.")
-            if name not in bucket:
-                raise StrategyError(
-                    f"Unknown strategy {name!r} in semantics version "
-                    f"{semantics_version}. Available: {sorted(bucket)}"
-                )
-            return bucket[name]
-
-        in_versions = [version for version, bucket in self._by_version.items() if name in bucket]
-        if not in_versions:
-            raise StrategyError(f"Unknown strategy {name!r}. Available: {self.qualified_names()}")
-        if len(in_versions) > 1:
-            keys = {self._by_version[version][name].behaviour_key() for version in in_versions}
-            if len(keys) == 1:
-                # Behaviourally identical in every version (e.g. 'random').
-                return self._by_version[max(in_versions)][name]
-            raise StrategyError(
-                f"Strategy {name!r} exists with different semantics in versions "
-                f"{sorted(in_versions)}. Request it explicitly, e.g. "
-                f"'v1:{name}' to reproduce published results or 'v2:{name}' for "
-                "the current definition. See docs/migration_strategies.md."
-            )
-        return self._by_version[in_versions[0]][name]
+        try:
+            return self._specs[str(name)]
+        except KeyError:
+            raise StrategyError(f"Unknown strategy {name!r}. Available: {self.names()}") from None
 
 
-STRATEGY_REGISTRY = StrategyRegistry((*_VERSION_1, *_VERSION_2))
+STRATEGY_REGISTRY = StrategyRegistry(_SPECS)
 
 #: The full ablation matrix required for the thesis, in report order.
 REQUIRED_STRATEGIES: tuple[str, ...] = (
-    "v2:random",
-    "v2:uncertainty",
-    "v2:novelty",
-    "v2:rarity",
-    "v2:coherence",
-    "v2:uncertainty_novelty",
-    "v2:uncertainty_rarity",
-    "v2:uncertainty_coherence",
-    "v2:rarity_coherence",
-    "v2:rarity_plus_coherence",
-    "v2:full",
-    "v2:full_no_coherence",
-    "v2:full_no_rarity",
-    "v2:full_no_uncertainty",
-    "v2:full_no_novelty",
-    "v2:proposal_formula",
-    "v2:revealed_full",
-    "v2:objectness_area_prior",
-    "v2:prior_full",
-    "v2:prior_revealed_full",
-    "v2:revealed_no_gate",
-    "v2:revealed_support_only",
-    "v1:rarity_no_coherence",
-    "v1:full_p05",
-    "v1:full_p1",
+    "random",
+    "uncertainty",
+    "novelty",
+    "rarity",
+    "coherence",
+    "uncertainty_novelty",
+    "uncertainty_rarity",
+    "uncertainty_coherence",
+    "rarity_coherence",
+    "rarity_plus_coherence",
+    "full",
+    "full_no_coherence",
+    "full_no_rarity",
+    "full_no_uncertainty",
+    "full_no_novelty",
+    "proposal_formula",
+    "revealed_full",
+    "objectness_area_prior",
+    "prior_full",
+    "prior_revealed_full",
+    "revealed_no_gate",
+    "revealed_support_only",
 )
 
 
@@ -716,11 +548,6 @@ def combine_components(
     for name, weight in weights.items():
         if weight > 0:
             scores = scores + weight * arrays[name]
-    if spec.weight_normalise:
-        total = sum(value for value in weights.values() if value > 0)
-        if total <= 0:
-            raise StrategyError(f"{spec.name}: cannot weight-normalise zero weights.")
-        scores = scores / total
     return scores
 
 
@@ -915,7 +742,6 @@ def score_pool(
 
     diagnostics: dict[str, object] = {
         "strategy": spec.name,
-        "semantics_version": spec.semantics_version,
         "proposals": count,
         "images": len(image_scores),
         "pseudo_classes": int(np.unique(pseudo_labels).size),

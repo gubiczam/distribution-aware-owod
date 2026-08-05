@@ -12,8 +12,8 @@ about the acquisition changes: the same strategy definitions, the same weights, 
 same coherence exponent, the same candidate pool, the same three severities, the
 same seeds, the same budgets, the same oracle, the same metrics.
 
-Two of the arms are **representation-invariant by construction**: ``v2:random``
-ignores the score entirely and ``v2:objectness_area_prior`` reads only objectness
+Two of the arms are **representation-invariant by construction**: ``random``
+ignores the score entirely and ``objectness_area_prior`` reads only objectness
 and box geometry. Their results must therefore be identical across every space, and
 the report checks that. If they ever differ, something other than the representation
 changed and the comparison is void — so the invariance check is the experiment's own
@@ -43,16 +43,16 @@ from daowod.pipeline import PipelineConfig, run_pipeline
 #: the two invariance controls plus the label-anchored gate, and every space gets
 #: exactly the same six.
 E4_STRATEGIES: tuple[str, ...] = (
-    "v2:random",
-    "v2:objectness_area_prior",
-    "v2:uncertainty_novelty",
-    "v2:full_no_coherence",
-    "v2:full",
-    "v2:revealed_full",
+    "random",
+    "objectness_area_prior",
+    "uncertainty_novelty",
+    "full_no_coherence",
+    "full",
+    "revealed_full",
 )
 
 #: Arms whose ranking cannot depend on the embedding. Used as the correctness check.
-INVARIANT_STRATEGIES: tuple[str, ...] = ("v2:random", "v2:objectness_area_prior")
+INVARIANT_STRATEGIES: tuple[str, ...] = ("random", "objectness_area_prior")
 
 E4_MODE_NAME = "E4REPRESENTATION"
 
@@ -345,7 +345,7 @@ def _summary(manifest, comparison, invariance) -> str:
     lines.append("## Correctness check: the representation-invariant arms")
     lines.append("")
     lines.append(
-        "`v2:random` and `v2:objectness_area_prior` cannot depend on the embedding. "
+        "`random` and `objectness_area_prior` cannot depend on the embedding. "
         "Their spread across representations must be exactly zero."
     )
     lines.append("")

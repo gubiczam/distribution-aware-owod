@@ -262,8 +262,8 @@ def test_the_matrix_covers_every_strategy_severity_and_seed(completed_run) -> No
     assert strategies == set(PRIMARY_STRATEGIES)
     assert severities == {spec.name for spec in TEST_MODE.imbalance_settings}
     assert seeds == set(TEST_MODE.seeds)
-    # Registry names, not the spec's short name, so tables join.
-    assert "full" not in strategies
+    # Plain registry names, so every table joins on the same key.
+    assert not any(":" in name for name in strategies)
 
 
 def test_severities_are_validated_and_distinct(completed_run) -> None:

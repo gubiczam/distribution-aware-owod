@@ -37,20 +37,20 @@ ObjectArray = NDArray[np.object_]
 #: The five strategies the plan requires, in report order. Names resolve through
 #: the existing registry so the arithmetic is the repository's canonical scorer.
 PRIMARY_STRATEGIES: tuple[str, ...] = (
-    "v2:random",
-    "v2:uncertainty",
-    "v2:uncertainty_novelty",
-    "v2:full_no_coherence",
-    "v2:full",
+    "random",
+    "uncertainty",
+    "uncertainty_novelty",
+    "full_no_coherence",
+    "full",
 )
 
 #: The label-anchored variants, which differ from the baseline in exactly one
 #: respect: where the distribution-aware term's rarity and coherence come from.
 #: See :mod:`daowod.revealed` for the measurements that motivate them.
 ANCHORED_STRATEGIES: tuple[str, ...] = (
-    "v2:revealed_support_only",
-    "v2:revealed_no_gate",
-    "v2:revealed_full",
+    "revealed_support_only",
+    "revealed_no_gate",
+    "revealed_full",
 )
 
 #: The free-heuristic control and its combinations. ``objectness_area_prior`` is
@@ -58,9 +58,9 @@ ANCHORED_STRATEGIES: tuple[str, ...] = (
 #: two ask whether the distribution term adds anything once the informativeness
 #: term actually works.
 PRIOR_STRATEGIES: tuple[str, ...] = (
-    "v2:objectness_area_prior",
-    "v2:prior_full",
-    "v2:prior_revealed_full",
+    "objectness_area_prior",
+    "prior_full",
+    "prior_revealed_full",
 )
 
 #: Baseline, control and new method in one matrix. Running them together is what
@@ -75,17 +75,17 @@ COMPARISON_STRATEGIES: tuple[str, ...] = (
 #: Human-readable mapping onto the plan's five numbered strategies, plus the
 #: label-anchored follow-ups.
 STRATEGY_ROLES: Mapping[str, str] = {
-    "v2:random": "1. Random",
-    "v2:uncertainty": "2. Uncertainty only",
-    "v2:uncertainty_novelty": "3. Uncertainty + Novelty",
-    "v2:full_no_coherence": "4. Uncertainty + Novelty + Rarity (ungated)",
-    "v2:full": "5. Coherence-aware distribution selection (gated) [BASELINE]",
-    "v2:revealed_support_only": "6. Revealed-unknown support only [NEW]",
-    "v2:revealed_no_gate": "7. Revealed-class rarity, ungated [NEW]",
-    "v2:revealed_full": "8. Label-anchored coherence gate [NEW]",
-    "v2:objectness_area_prior": "C. Objectness x box scale prior [FREE CONTROL]",
-    "v2:prior_full": "9. Prior + cluster-based gate [NEW]",
-    "v2:prior_revealed_full": "10. Prior + label-anchored gate [NEW]",
+    "random": "1. Random",
+    "uncertainty": "2. Uncertainty only",
+    "uncertainty_novelty": "3. Uncertainty + Novelty",
+    "full_no_coherence": "4. Uncertainty + Novelty + Rarity (ungated)",
+    "full": "5. Coherence-aware distribution selection (gated) [BASELINE]",
+    "revealed_support_only": "6. Revealed-unknown support only [NEW]",
+    "revealed_no_gate": "7. Revealed-class rarity, ungated [NEW]",
+    "revealed_full": "8. Label-anchored coherence gate [NEW]",
+    "objectness_area_prior": "C. Objectness x box scale prior [FREE CONTROL]",
+    "prior_full": "9. Prior + cluster-based gate [NEW]",
+    "prior_revealed_full": "10. Prior + label-anchored gate [NEW]",
 }
 
 #: Which family each strategy belongs to, so every report can separate the
@@ -93,9 +93,9 @@ STRATEGY_ROLES: Mapping[str, str] = {
 STRATEGY_FAMILY: Mapping[str, str] = {
     **{name: "baseline" for name in PRIMARY_STRATEGIES},
     **{name: "label-anchored" for name in ANCHORED_STRATEGIES},
-    "v2:objectness_area_prior": "free-control",
-    "v2:prior_full": "prior+cluster",
-    "v2:prior_revealed_full": "prior+anchored",
+    "objectness_area_prior": "free-control",
+    "prior_full": "prior+cluster",
+    "prior_revealed_full": "prior+anchored",
 }
 
 
@@ -441,7 +441,7 @@ def run_study(
                     isolated=isolated,
                 )
                 # The campaign labels itself with the spec's short name ("full");
-                # every table joins on the registry name ("v2:full"), so the
+                # every table joins on the registry name ("full"), so the
                 # canonical name is stamped here rather than in two readers.
                 for row in rows:
                     row["strategy"] = strategy_name
@@ -571,7 +571,7 @@ def ablation_specs(
     gammas: Sequence[float] = (0.25, 0.5, 0.75),
     coherence_methods: Sequence[str] = ("relative_within_cluster", "radius_core"),
     neighbour_counts: Sequence[int] = (3, 10),
-    base: str = "v2:full",
+    base: str = "full",
 ) -> list[StrategySpec]:
     """The ablation grid: gate form x coherence definition x neighbourhood size.
 
@@ -720,7 +720,7 @@ def select_hyperparameters(
     touched, so that the reported numbers are not selected on their own data.
     """
 
-    root = _resolve("v2:full")
+    root = _resolve("full")
     specs = [
         replace(
             root,
@@ -789,7 +789,7 @@ def leakage_check(
     prepared: PreparedPool,
     reference_embeddings: ArrayLike,
     config: StudyConfig,
-    strategy: str = "v2:full",
+    strategy: str = "full",
     seed: int = 0,
 ) -> dict[str, object]:
     """Prove the acquisition score is reproducible from non-oracle components.

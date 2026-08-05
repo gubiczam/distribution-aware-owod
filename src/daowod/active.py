@@ -375,7 +375,7 @@ def select_batch(
     Ties are broken by proposal ID, not array position, so two strategies that
     produce identical scores also produce identical selections regardless of how
     the pool was assembled. ``random_selection`` samples uniformly from whatever
-    is still available, which is the ``v2:random`` control.
+    is still available, which is the ``random`` control.
     """
 
     values = np.asarray(scores, dtype=np.float64)

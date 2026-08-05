@@ -203,8 +203,8 @@ def test_cold_first_round_is_identical_to_the_unsupervised_baseline() -> None:
     """Nothing is revealed before round one, so the first ranking must match."""
 
     pool = make_pool()
-    baseline = STRATEGY_REGISTRY.resolve("v2:full")
-    anchored = STRATEGY_REGISTRY.resolve("v2:revealed_full")
+    baseline = STRATEGY_REGISTRY.resolve("full")
+    anchored = STRATEGY_REGISTRY.resolve("revealed_full")
     state_b = active.initial_state(pool_size=pool.size, reference_embeddings=pool.embeddings[:4])
     state_a = active.initial_state(pool_size=pool.size, reference_embeddings=pool.embeddings[:4])
     first_b = active.score_round(pool=pool, spec=baseline, state=state_b, seed=0)
@@ -218,7 +218,7 @@ def test_the_bank_grows_only_with_annotated_regions() -> None:
     pool = make_pool()
     classes, unknown = _truth(pool)
     result = _run(
-        STRATEGY_REGISTRY.resolve("v2:revealed_full"),
+        STRATEGY_REGISTRY.resolve("revealed_full"),
         pool,
         gt_class=classes,
         gt_unknown=unknown,
@@ -244,7 +244,7 @@ def test_anchored_scores_ignore_the_ground_truth_of_unannotated_regions() -> Non
 
     pool = make_pool()
     classes, unknown = _truth(pool)
-    spec = STRATEGY_REGISTRY.resolve("v2:revealed_full")
+    spec = STRATEGY_REGISTRY.resolve("revealed_full")
     honest = _run(spec, pool, gt_class=classes, gt_unknown=unknown)
 
     scrambled_classes = classes.copy()
@@ -265,11 +265,9 @@ def test_anchored_estimator_changes_the_trajectory_once_labels_exist() -> None:
 
     pool = make_pool()
     classes, unknown = _truth(pool)
-    baseline = _run(
-        STRATEGY_REGISTRY.resolve("v2:full"), pool, gt_class=classes, gt_unknown=unknown
-    )
+    baseline = _run(STRATEGY_REGISTRY.resolve("full"), pool, gt_class=classes, gt_unknown=unknown)
     anchored = _run(
-        STRATEGY_REGISTRY.resolve("v2:revealed_full"), pool, gt_class=classes, gt_unknown=unknown
+        STRATEGY_REGISTRY.resolve("revealed_full"), pool, gt_class=classes, gt_unknown=unknown
     )
     assert baseline.selection_order.tolist() != anchored.selection_order.tolist()
     # ...and the first round, being cold, must agree.
@@ -280,7 +278,7 @@ def test_anchored_estimator_changes_the_trajectory_once_labels_exist() -> None:
 def test_anchored_round_records_its_bank_state() -> None:
     pool = make_pool()
     classes, unknown = _truth(pool)
-    spec = STRATEGY_REGISTRY.resolve("v2:revealed_full")
+    spec = STRATEGY_REGISTRY.resolve("revealed_full")
     state = active.initial_state(pool_size=pool.size, reference_embeddings=pool.embeddings[:4])
     first = active.score_round(pool=pool, spec=spec, state=state, seed=0)
     selected = active.select_batch(first.scores, batch_size=12, proposal_ids=pool.proposal_ids)
@@ -304,13 +302,13 @@ def test_anchored_round_records_its_bank_state() -> None:
 
 
 def test_the_baseline_is_untouched_by_the_new_estimator() -> None:
-    for name in ("v2:full", "v2:full_no_coherence", "v2:uncertainty", "v2:random"):
+    for name in ("full", "full_no_coherence", "uncertainty", "random"):
         assert STRATEGY_REGISTRY.resolve(name).distribution_estimator == "cluster"
 
 
 def test_anchored_strategies_share_the_baseline_weights_and_gate_form() -> None:
-    baseline = STRATEGY_REGISTRY.resolve("v2:full")
-    anchored = STRATEGY_REGISTRY.resolve("v2:revealed_full")
+    baseline = STRATEGY_REGISTRY.resolve("full")
+    anchored = STRATEGY_REGISTRY.resolve("revealed_full")
     assert anchored.weights() == baseline.weights()
     assert anchored.coherence_exponent == baseline.coherence_exponent
     assert anchored.distribution_estimator == "revealed"
@@ -358,7 +356,7 @@ def test_objectness_area_prior_requires_both_inputs() -> None:
 def test_prior_strategies_are_scored_end_to_end() -> None:
     pool = make_pool()
     classes, unknown = _truth(pool)
-    for name in ("v2:objectness_area_prior", "v2:prior_full", "v2:prior_revealed_full"):
+    for name in ("objectness_area_prior", "prior_full", "prior_revealed_full"):
         result = _run(STRATEGY_REGISTRY.resolve(name), pool, gt_class=classes, gt_unknown=unknown)
         assert result.selection_order.size == 18
 
@@ -372,7 +370,7 @@ def test_the_comparison_matrix_holds_baseline_control_and_new_arms() -> None:
     assert "baseline" in families
     assert "free-control" in families
     assert "label-anchored" in families
-    assert "v2:full" in annotation_study.COMPARISON_STRATEGIES  # the baseline is retained
+    assert "full" in annotation_study.COMPARISON_STRATEGIES  # the baseline is retained
     assert len(annotation_study.COMPARISON_STRATEGIES) == 11
 
 
@@ -382,7 +380,7 @@ def test_per_round_anchored_diagnostics_are_recorded() -> None:
     pool = make_pool()
     classes, unknown = _truth(pool)
     result = _run(
-        STRATEGY_REGISTRY.resolve("v2:revealed_full"),
+        STRATEGY_REGISTRY.resolve("revealed_full"),
         pool,
         gt_class=classes,
         gt_unknown=unknown,
@@ -401,5 +399,5 @@ def test_per_round_anchored_diagnostics_are_recorded() -> None:
 def test_baseline_rounds_carry_no_anchored_report() -> None:
     pool = make_pool()
     classes, unknown = _truth(pool)
-    result = _run(STRATEGY_REGISTRY.resolve("v2:full"), pool, gt_class=classes, gt_unknown=unknown)
+    result = _run(STRATEGY_REGISTRY.resolve("full"), pool, gt_class=classes, gt_unknown=unknown)
     assert all(not round_result.anchored for round_result in result.rounds)

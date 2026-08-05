@@ -3,11 +3,11 @@
 This is the single place each component is defined. Design decisions recorded
 here follow ``docs/decisions.md``:
 
-* **Uncertainty** (Decision 1) defaults to normalised predictive entropy over the
-  exported posterior. The legacy ``1 - |2c - 1|`` transform of the PROB unknown
-  score is retained under the explicit name ``legacy_prob_score`` because the
-  audit showed it is a strictly monotone rescaling of the score used to select
-  which proposals exist at all (Spearman +1.000).
+* **Uncertainty** (Decision 1) is normalised predictive entropy over the exported
+  posterior. A pre-audit ``1 - |2c - 1|`` transform of the PROB unknown score was
+  removed with the v1 semantics: the audit showed it is a strictly monotone
+  rescaling of the score that selects which proposals exist at all
+  (Spearman +1.000), so it cannot add information to the pool it defines.
 * **Rarity** (Decision 3) represents relative sparsity of a proposal's
   pseudo-class.
 * **Coherence** (Decision 3) must answer "is this proposal part of a locally
@@ -36,7 +36,6 @@ UncertaintyMethod = Literal[
     "one_minus_max",
     "objectness_weighted_entropy",
     "objectness_area_prior",
-    "legacy_prob_score",
 ]
 UNCERTAINTY_METHODS: tuple[str, ...] = (
     "entropy",
@@ -44,7 +43,6 @@ UNCERTAINTY_METHODS: tuple[str, ...] = (
     "one_minus_max",
     "objectness_weighted_entropy",
     "objectness_area_prior",
-    "legacy_prob_score",
 )
 
 RarityMethod = Literal["log_inverse_frequency", "inverse_frequency", "negative_count"]
@@ -121,7 +119,6 @@ def compute_uncertainty(
     ``one_minus_max``               1 - p_top1
     ``objectness_weighted_entropy`` sqrt(entropy * unknown score)
     ``objectness_area_prior``       objectness * sqrt(box area)
-    ``legacy_prob_score``           1 - |2c - 1| (deprecated, see audit S2)
 
     ``objectness_area_prior`` is not an uncertainty at all; it occupies the same
     ``U(x)`` slot as an *informativeness prior*, and it is here because the audit
@@ -193,14 +190,6 @@ def compute_uncertainty(
 
         return np.sqrt(normalise(scores, "rank") * normalise(scale, "rank"))
 
-    if method == "legacy_prob_score":
-        if confidence is None:
-            raise ValueError("legacy_prob_score requires confidence values.")
-        values = as_vector("confidence", confidence)
-        if np.any((values < 0) | (values > 1)):
-            raise ValueError("confidence must be in [0, 1].")
-        return 1.0 - np.abs(2.0 * values - 1.0)
-
     if method not in UNCERTAINTY_METHODS:
         raise ValueError(
             f"Unknown uncertainty method: {method!r}. Supported: {list(UNCERTAINTY_METHODS)}"
@@ -208,9 +197,8 @@ def compute_uncertainty(
     if posterior is None:
         raise ValueError(
             f"Uncertainty method {method!r} requires the exported posterior. "
-            "Re-export proposals with a bridge that writes 'posterior', or set "
-            "uncertainty_method='legacy_prob_score' to use the deprecated "
-            "confidence transform."
+            "Re-export proposals with a bridge that writes 'posterior', or choose "
+            "'objectness_area_prior', which needs only objectness and boxes."
         )
     probabilities = _probabilities(posterior)
     if method == "entropy":

@@ -16,7 +16,7 @@ from daowod.scoring import REQUIRED_STRATEGIES, STRATEGY_REGISTRY
 
 
 def _command_strategies(args: argparse.Namespace) -> int:
-    names = REQUIRED_STRATEGIES if args.required_only else STRATEGY_REGISTRY.qualified_names()
+    names = REQUIRED_STRATEGIES if args.required_only else STRATEGY_REGISTRY.names()
     for name in names:
         spec = STRATEGY_REGISTRY.resolve(name)
         weights = {key: value for key, value in spec.weights().items() if value > 0}

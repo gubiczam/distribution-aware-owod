@@ -49,24 +49,24 @@ MARKERS: tuple[str, ...] = ("o", "s", "^", "D", "v")
 
 #: Strategy -> colour and marker, fixed by entity so figures stay comparable.
 STRATEGY_ORDER: tuple[str, ...] = (
-    "v2:random",
-    "v2:uncertainty",
-    "v2:uncertainty_novelty",
-    "v2:full_no_coherence",
-    "v2:full",
+    "random",
+    "uncertainty",
+    "uncertainty_novelty",
+    "full_no_coherence",
+    "full",
 )
 STRATEGY_LABELS: Mapping[str, str] = {
-    "v2:random": "Random",
-    "v2:uncertainty": "Uncertainty",
-    "v2:uncertainty_novelty": "Uncertainty + Novelty",
-    "v2:full_no_coherence": "+ Rarity (ungated)",
-    "v2:full": "+ Rarity x Coherence (gated) [baseline]",
-    "v2:objectness_area_prior": "Objectness x box scale [free control]",
-    "v2:prior_full": "Prior + cluster gate",
-    "v2:prior_revealed_full": "Prior + anchored gate",
-    "v2:revealed_support_only": "Anchored support only",
-    "v2:revealed_no_gate": "Anchored rarity, ungated",
-    "v2:revealed_full": "Anchored gate",
+    "random": "Random",
+    "uncertainty": "Uncertainty",
+    "uncertainty_novelty": "Uncertainty + Novelty",
+    "full_no_coherence": "+ Rarity (ungated)",
+    "full": "+ Rarity x Coherence (gated) [baseline]",
+    "objectness_area_prior": "Objectness x box scale [free control]",
+    "prior_full": "Prior + cluster gate",
+    "prior_revealed_full": "Prior + anchored gate",
+    "revealed_support_only": "Anchored support only",
+    "revealed_no_gate": "Anchored rarity, ungated",
+    "revealed_full": "Anchored gate",
 }
 STRATEGY_COLOURS: Mapping[str, str] = dict(zip(STRATEGY_ORDER, CATEGORICAL, strict=True))
 STRATEGY_MARKERS: Mapping[str, str] = dict(zip(STRATEGY_ORDER, MARKERS, strict=True))
@@ -74,17 +74,17 @@ STRATEGY_MARKERS: Mapping[str, str] = dict(zip(STRATEGY_ORDER, MARKERS, strict=T
 #: Arm ordering for the eleven-arm comparison, baseline family first so a legend
 #: reads in the same order as the report's tables.
 COMPARISON_ORDER: tuple[str, ...] = (
-    "v2:random",
-    "v2:uncertainty",
-    "v2:uncertainty_novelty",
-    "v2:full_no_coherence",
-    "v2:full",
-    "v2:objectness_area_prior",
-    "v2:prior_full",
-    "v2:prior_revealed_full",
-    "v2:revealed_support_only",
-    "v2:revealed_no_gate",
-    "v2:revealed_full",
+    "random",
+    "uncertainty",
+    "uncertainty_novelty",
+    "full_no_coherence",
+    "full",
+    "objectness_area_prior",
+    "prior_full",
+    "prior_revealed_full",
+    "revealed_support_only",
+    "revealed_no_gate",
+    "revealed_full",
 )
 
 #: The curated headline set. Eleven arms cannot each own a hue — the validated
@@ -94,10 +94,10 @@ COMPARISON_ORDER: tuple[str, ...] = (
 #: is the documented "fold to Other or facet" rule, applied rather than worked
 #: around by generating hues.
 HEADLINE_STRATEGIES: tuple[str, ...] = (
-    "v2:random",
-    "v2:full",
-    "v2:objectness_area_prior",
-    "v2:prior_revealed_full",
+    "random",
+    "full",
+    "objectness_area_prior",
+    "prior_revealed_full",
 )
 
 #: Family -> colour. With more arms than hues, colour carries the *family*, which
@@ -543,7 +543,7 @@ def component_distributions(
     rows: Sequence[Mapping[str, object]],
     directory: str | Path,
     *,
-    strategy: str = "v2:full",
+    strategy: str = "full",
     severity: str | None = None,
     name: str = "figure_component_distributions",
 ) -> list[Path]:
@@ -915,7 +915,7 @@ def family_panels(
         return []
 
     baseline_budgets, baseline_means, _ = _series(
-        rows, severity=severity, strategy="v2:full", metric=metric
+        rows, severity=severity, strategy="full", metric=metric
     )
     columns = min(len(ordered), 3)
     rows_needed = (len(ordered) + columns - 1) // columns
@@ -929,7 +929,7 @@ def family_panels(
                 color=TEXT_SECONDARY,
                 linewidth=1.4,
                 linestyle="--",
-                label="baseline v2:full",
+                label="baseline full",
             )
         members = [
             strategy for strategy in COMPARISON_ORDER if strategy in families[family]

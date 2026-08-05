@@ -29,11 +29,11 @@ from daowod.annotation_study import STRATEGY_ROLES, StudyOutputs
 
 #: The strategy the headline comparison is read against, and the two rungs below
 #: it that isolate what each added term contributes.
-BASELINE_STRATEGY = "v2:random"
-UNCERTAINTY_STRATEGY = "v2:uncertainty"
-NOVELTY_STRATEGY = "v2:uncertainty_novelty"
-UNGATED_STRATEGY = "v2:full_no_coherence"
-GATED_STRATEGY = "v2:full"
+BASELINE_STRATEGY = "random"
+UNCERTAINTY_STRATEGY = "uncertainty"
+NOVELTY_STRATEGY = "uncertainty_novelty"
+UNGATED_STRATEGY = "full_no_coherence"
+GATED_STRATEGY = "full"
 
 
 def write_csv(path: str | Path, rows: Sequence[Mapping[str, object]]) -> Path:
