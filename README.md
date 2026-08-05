@@ -1,273 +1,150 @@
-# Distribution-Aware OWOD
+# Distribution-Aware Open-World Object Detection
 
-Minimal research code for Contribution A of a BME TDK project on distribution-aware
-active annotation for Open-World Object Detection (OWOD).
+Research code for a BME TDK project on the effect of **long-tailed unknown-class
+distributions** in Open-World Object Detection (OWOD), and on two ways of acting on it.
 
-The project studies fixed-budget image selection when unknown classes follow a long-tail
-distribution. Standard active-learning scores can over-select isolated unknown-looking
-outliers. This repository adds a rarity term that is useful only when the proposal is
-locally coherent with nearby proposals.
+Existing OWOD methods report a single aggregate U-Recall and known-mAP. The project's
+premise is that this hides structure: rare unknown classes are suppressed by frequent
+ones, labelling cost is badly distributed, and rare new classes are lost during
+incremental update. All three are manifestations of one long-tail problem, and
+head/medium/tail-resolved evaluation is the instrument that exposes it.
 
-## Contribution A
+The contract for everything here is [`docs/proposal.docx`](docs/proposal.docx), read into
+[`docs/research_design.md`](docs/research_design.md).
 
-For each candidate proposal, the acquisition score is
+## The two contributions
 
-```text
-score = alpha * uncertainty
-      + beta * novelty
-      + gamma * rarity * coherence**p
-```
-
-`coherence` gates only the rarity contribution. An isolated proposal may still be
-uncertain or novel, but its low local coherence suppresses the rarity bonus.
-
-Acquisition arms, all resolved through the one canonical scorer
-(`daowod.scoring.STRATEGY_REGISTRY`, `v2:` names):
-
-| arm | `U(x)` | distribution term |
-|---|---|---|
-| `random` | — | — |
-| `uncertainty` | posterior entropy | — |
-| `uncertainty_novelty` | posterior entropy | — |
-| `full_no_coherence` | posterior entropy | cluster rarity, ungated |
-| `full` | posterior entropy | cluster rarity x pool density **(baseline)** |
-| `objectness_area_prior` | objectness x box scale | — **(free control)** |
-| `prior_full` | objectness x box scale | cluster rarity x pool density |
-| `prior_revealed_full` | objectness x box scale | revealed rarity x revealed support |
-| `revealed_support_only` | posterior entropy | revealed support only |
-| `revealed_no_gate` | posterior entropy | revealed rarity, ungated |
-| `revealed_full` | posterior entropy | revealed rarity x revealed support |
-
-Plus single-component and ablation variants (`novelty`, `rarity`, `coherence`,
-`rarity_plus_coherence`, `proposal_formula`, the `full_no_*` family) and the
-version-1 specs that reproduce pre-audit numbers bit for bit.
-
-## Two experiments
-
-> **Where the science stands.** The coherence gate, as specified, does **not**
-> improve tail discovery on real S-OWODB Task-1 proposals. Three experiments, all
-> frozen and reproducible:
->
-> 1. [`contribution_a_failure_analysis.md`](docs/contribution_a_failure_analysis.md)
->    — the component audit. Every term of the baseline score selects *worse than
->    random* in the top 4 % of the ranking, while a one-line `objectness × box scale`
->    prior finds 1.9× more unknown objects.
-> 2. [`contribution_a_revealed_results.md`](docs/contribution_a_revealed_results.md)
->    — the eleven-arm follow-up. Anchoring the distribution term on oracle-revealed
->    labels halves the damage it does but does not make it profitable.
-> 3. [`e4_representation_results.md`](docs/e4_representation_results.md) — is the
->    failure the embedding or the formulation? Re-embedding the same boxes with DINO
->    ResNet-50 moves the median unknown region's nearest same-class sibling from the
->    **202nd** neighbour to the **6th**, so the decoder embedding really does destroy
->    semantic neighbourhoods — yet background stays the most locally homogeneous
->    stratum in every space, so the gate's premise still fails.
->
-> The baseline is retained unchanged in all of them.
-
-**Region-level annotation study (the main deliverable).** An offline active
-annotation simulation over real PROB proposals: every strategy spends the same
-region-level oracle budget on the same candidate pool, and the metrics describe the
-resulting *annotation set*. One cached export supports the whole matrix, so the loop
-never touches a GPU. Runs end to end from
-`notebooks/contribution_a_active_annotation.ipynb` on a single T4 in about four to
-five hours. See [`docs/contribution_a_active_annotation.md`](docs/contribution_a_active_annotation.md).
+**A — distribution-aware active annotation.** Under a bounded oracle, which candidate
+region should be labelled next? The score is the proposal's equation (1):
 
 ```text
-preflight -> disjoint reference/pilot/evaluation splits -> cached PROB inference
--> candidate proposals -> region-level oracle -> controlled long-tail pools
--> leakage proof -> pilot hyperparameter choice -> runtime projection
--> acquisition strategies -> metrics -> plots -> CSVs -> summary -> ZIP
+s(x) = U(x) + λ·D(x) + γ·w(ĉ(x))·coh(x)          w(c) ∝ 1/n_c
 ```
 
-**Image-level campaign with retraining.** The older loop that spends an *image*
-budget and calls PROB to retrain between rounds, ending in official OWOD metrics.
+`coh` gates **only** the rarity term, so an isolated proposal keeps its uncertainty and
+novelty but loses its rarity bonus. The claim under test is that this AND relation
+separates a genuinely rare class from an isolated false positive.
 
-```text
-PROB proposals
--> uncertainty
--> novelty against labelled reference embeddings
--> pseudo-label assignment by prediction or clustering
--> rarity from estimated pseudo-class frequency
--> local coherence
--> proposal score
--> top-k image aggregation
--> fixed-budget image selection
--> annotation
--> PROB retraining
--> OWOD evaluation
-```
+> **Where the science stands.** The gate's premise is **falsified** on real S-OWODB
+> Task-1 proposals: background is the most locally homogeneous stratum in the pool
+> (tail same-label fraction 0.015 against background's 0.888), so a homogeneity-based
+> coherence term ranks background highest. A one-line `objectness × box scale` prior
+> finds **1.88×** more unknown objects than the full distribution-aware score. This
+> holds in all nine feature spaces tested. Read [`docs/results.md`](docs/results.md)
+> before interpreting any output — it is a result about a named hypothesis, not a bug.
 
-## Repository Structure
+**B — distribution-aware exemplar allocation.** Replay memory is normally split evenly
+per class, which hurts the tail. The rule under test allocates `m_c ∝ n_c^α` with
+`Σm_c = M`: `α=0` uniform (the standard), `α=1` size-proportional, `α<0` tail-favouring.
 
-```text
-configs/experiment.yaml         Editable experiment configuration
+> **Status: allocation core only.** [`src/daowod/memory.py`](src/daowod/memory.py) is
+> mathematically complete and unit-tested — exact integer conservation, deterministic
+> ties, both granularities. The *research question* — the optimal `α` and how it moves
+> with tail severity — needs real incremental model updates and is **not measured**.
+> No offline forgetting proxy is provided, because forgetting is a property of a trained
+> model, not of a buffer. See `docs/research_design.md` §8.
 
-notebooks/contribution_a_active_annotation.ipynb
-                                Main executable Colab notebook (annotation study)
-analysis/build_contribution_a_notebook.py
-                                Generator for that notebook
-analysis/audit_coherence_failure.py
-                                Component audit behind the failure analysis
-analysis/e4_required_rows.py    Which export rows E4 must re-embed
-analysis/extract_region_embeddings.py
-                                Re-embed the boxes with DINO / ImageNet (torch env)
-analysis/experiment_e4_representations.py
-                                E4 Phases 3, 4, 6: geometry and figures
-analysis/run_e4_active_learning.py
-                                E4 Phase 5: same strategies, different space
-
-src/daowod/scoring.py           The one canonical acquisition scorer and registry
-src/daowod/components.py        Uncertainty, novelty, rarity, coherence
-src/daowod/normalisation.py     Component normalisation
-
-src/daowod/candidates.py        Candidate-pool construction (PROB outputs only)
-src/daowod/oracle.py            Region-level ground-truth matching
-src/daowod/longtail.py          Controlled long-tail severities and denominators
-src/daowod/active.py            Multi-round region-level acquisition loop
-src/daowod/discovery.py         Discovery / efficiency / robustness metrics
-src/daowod/annotation_study.py  Study matrix, ablations, pilot selection
-src/daowod/modes.py             DEBUG / FAST / MAIN execution modes
-src/daowod/runtime.py           Runtime projection and budget-driven downscaling
-src/daowod/preflight.py         Environment, GPU, dataset, checkpoint validation
-src/daowod/export_cache.py      Cached, resumable PROB inference
-src/daowod/audit.py             Component diagnostics for a negative result
-src/daowod/revealed.py          Label-anchored rarity and support
-src/daowod/representations.py   E4 feature spaces: PROB, crop encoders, transforms
-src/daowod/geometry.py          E4 geometry metrics for a feature space
-src/daowod/representation_plots.py
-                                E4 projections and comparison figures
-src/daowod/plots.py             Publication figures
-src/daowod/reporting.py         CSVs, summary, ZIP, artifact verification
-src/daowod/pipeline.py          Stage sequencing and resume
-
-src/daowod/acquisition.py       Legacy scoring facade (kept for reproducibility)
-src/daowod/config.py            YAML configuration loading
-src/daowod/dataset.py           VOC image IDs, annotations, pools
-src/daowod/prob_adapter.py      Explicit subprocess boundary to PROB
-src/daowod/experiment.py        Multi-seed image-level campaign orchestration
-src/daowod/metrics.py           Head/medium/tail unknown recall diagnostics
-
-tests/test_active_annotation.py Unit tests for the annotation study
-tests/test_revealed_distribution.py
-                                Tests for label-anchored estimation and the prior
-tests/test_representation_geometry.py
-                                Tests for E4 feature spaces and geometry metrics
-tests/test_study_pipeline.py    End-to-end pipeline test on a fabricated export
-tests/test_smoke.py             Small correctness smoke suite
-```
-
-## Current Status
-
-Implemented in this repository:
-
-- deterministic labelled/pool state;
-- image-level long-tail pool construction without partial annotations;
-- proposal-level uncertainty, novelty, rarity, coherence, and scoring;
-- deterministic fixed-budget image selection;
-- ingestion of official PROB metrics JSON;
-- grouped unknown recall diagnostics;
-- the complete region-level annotation study: candidate pool, region oracle,
-  controlled long-tail severities, multi-round acquisition, discovery metrics,
-  ablations, plots, reports, and a resumable Colab pipeline.
-
-Still external to this repository:
-
-- real PROB training;
-- real PROB evaluation;
-- the proposal export itself, which runs inside a PROB checkout through
-  `daowod_prob_bridge.py` (the pipeline calls it and caches the result).
-
-The official PROB evaluator remains the source for known mAP, standard U-Recall,
-Wilderness Impact, and A-OSE. This repository adds grouped diagnostic recall and
-annotation-set quality metrics; it does not claim detector numbers.
-
-## Installation
+## Reproduce
 
 ```bash
-python -m pip install --editable ".[dev]"
+python -m pip install --editable ".[dev]"     # Python 3.11
+pytest                                        # 215 tests, no GPU, seconds
 ```
 
-The package supports Python 3.11.
+| Experiment | Command |
+|---|---|
+| **Contribution A** (the study) | `python experiments/contribution_a.py study --mode DEBUG --no-gpu ...` |
+| Component audit (why the gate failed) | `python experiments/contribution_a.py audit ...` |
+| Representation geometry (nine spaces) | `python experiments/contribution_a.py representation ...` |
+| **Contribution B** (α sweep) | `python experiments/contribution_b.py --config configs/contribution_b.yaml` |
+| Strategy registry | `daowod-run strategies` |
 
-## Checks
+Start with `--mode DEBUG`: it exercises every stage in minutes with no GPU, and prints
+that its numbers are not reportable. Then `FAST`, then `MAIN`. On Colab use
+[`notebooks/contribution_a_colab.ipynb`](notebooks/contribution_a_colab.ipynb), which is
+a thin shim over the same entrypoint.
 
-```bash
-ruff check .
-ruff format --check .
-pytest
-python -m compileall -q src
-```
+Full protocol, splits, PROB boundary and the exact commands:
+[`docs/reproduction.md`](docs/reproduction.md). Large binaries and their digests:
+[`docs/artifacts.md`](docs/artifacts.md).
 
-## Colab Notebook
-
-Open `notebooks/contribution_a_active_annotation.ipynb` in Google Colab (T4
-runtime) for the region-level annotation study. Edit only the configuration cell,
-run `RUN_MODE = "DEBUG"` first (minutes, no GPU needed), then `"MAIN"`. It clones
-this repository and the PROB fork, builds the deformable-attention CUDA extension,
-validates every precondition, exports proposals once into a resumable cache, runs
-the full strategy matrix, and writes CSVs, figures, a markdown research summary and
-a ZIP.
-
-Set `RUN_MODE = "MAINREVEALED"` for the eleven-arm follow-up that adds the
-free informativeness-prior control and the label-anchored distribution term beside
-the baseline.
-
-`notebooks/contribution_a.ipynb` remains the older image-level notebook. It clones
-this repository and the official PROB repository, installs DAOWOD, runs the local
-checks, and executes detector-independent synthetic validation without requiring
-external data.
-
-Optional real PROB integration requires this Google Drive layout:
+## Layout
 
 ```text
-MyDrive/DAOWOD/
-|-- data/
-|   `-- OWOD/
-|       |-- JPEGImages/
-|       |-- Annotations/
-|       `-- ImageSets/
-|           `-- TOWOD/
-`-- checkpoints/
-    `-- MOWODB/
-        `-- t1.pth
+docs/
+  proposal.docx        the contract
+  research_design.md   requirements, cited to the proposal; §7 what it does NOT require
+  reproduction.md      protocol, splits, PROB boundary, commands, measured design decisions
+  results.md           Contribution A's measured results, including the falsification
+  artifacts.md         large-binary manifest: digests, locations, regeneration
+
+configs/
+  contribution_a.yaml  THE protocol: pool sizes, budgets, rounds, seeds, arms, severities
+  contribution_b.yaml  memory budget, α grid, granularity
+
+data/protocol/         version-controlled split IDs and class groups (digest-pinned)
+
+src/daowod/            18 modules, flat
+  cli.py               registry inspection
+  config.py            execution modes: the YAML schema and loader
+  scoring.py         ★ equation (1): the one scorer and the one registry
+  components.py      ★ U · D · rarity · coh, cluster and label-anchored estimators
+  candidates.py        candidate pool from PROB outputs only, ground-truth free
+  oracle.py            region-level ground-truth matching + the no-leakage guard
+  dataset.py           VOC image IDs, annotations, pools
+  longtail.py          head/medium/tail groups + controlled tail severities
+  representations.py   the nine feature spaces
+  annotation.py      ★A multi-round region acquisition, iterative ĉ / n̂_c refresh
+  study.py           ★A arm × severity × seed matrix, pilot/evaluation split
+  memory.py          ★B m_c ∝ n_c^α allocation core
+  discovery.py         annotation-set quality, tail discovery, efficiency curve
+  geometry.py          feature-space geometry against the oracle strata
+  audit.py             component-level mechanism diagnostics
+  figures.py           every publication figure
+  tables.py            CSVs, JSON manifests, markdown summary
+  pipeline.py          preflight + cost estimate + stage sequencing + resume
+  detector.py          the only module that talks to PROB: adapter + export cache
+
+experiments/           one file per experiment; contribution_a.py is the entrypoint
+notebooks/             one thin Colab shim per contribution
+tests/                 215 tests, fixtures.py is the only synthetic pool
 ```
 
-When those assets and a compatible PROB attention backend are available, the notebook
-can run a one-image proposal export smoke test and score the exported proposal
-features. Missing Drive data or checkpoints are reported as `MISSING` or `SKIPPED`,
-not as code failures.
+### Where to make a change
 
-## PROB Schemas
+| To change… | Edit |
+|---|---|
+| the acquisition formula | `src/daowod/scoring.py`, `src/daowod/components.py` |
+| how tail rarity is estimated | `src/daowod/components.py` |
+| which arms are compared, pool size, seeds | `configs/contribution_a.yaml` |
+| the memory allocation rule | `src/daowod/memory.py` |
+| a metric | `discovery.py` / `geometry.py` / `audit.py` |
+| a figure | `src/daowod/figures.py` |
+| add an experiment | a file in `experiments/` + a subcommand |
 
-The main repository talks to PROB only through `src/daowod/prob_adapter.py`.
+## Design rules this repository holds to
 
-Proposal NPZ files must contain:
+1. **One scorer.** Exactly one implementation of equation (1) and one strategy registry.
+   Names are plain (`full`, not `v2:full`); there is no second semantics version.
+2. **Ground truth is a protocol and evaluation input, never an acquisition input.**
+   Enforced by two automated checks, one of which re-derives every score from its
+   recorded components, so it constrains arithmetic rather than naming.
+3. **Real data or nothing.** No synthetic-pool result is ever reported. The one
+   deterministic fixture lives in `tests/` and says so.
+4. **The protocol is never mutated to fit a clock.** An earlier version shrank the
+   evaluation pool when the runtime projection did not fit, silently moving every
+   reported denominator. The preflight now estimates runtime, disk and memory, prints
+   them, and **refuses to start** if a declared limit is exceeded.
+5. **The library never imports torch.** PROB is reached only through a subprocess and a
+   content-keyed export cache whose fingerprint covers everything that could change one
+   exported number.
+6. **Negative results are first-class.** The falsified gate premise keeps its code, its
+   data path and its document, because it falsifies a hypothesis the proposal states.
 
-- `image_ids`
-- `confidence`
-- `embeddings`
+## What is not implemented
 
-They may also contain:
-
-- `posterior`
-- `predicted_labels`
-- `boxes`
-- `objectness`
-
-Metrics JSON files must contain:
-
-- `known_mAP`
-- `U_Recall`
-- `WI`
-- `A_OSE`
-
-They may also contain:
-
-- `detections_path`, pointing to a JSON file with `ground_truth` and `detections`
-  entries for grouped unknown recall diagnostics.
-
-## Configuration
-
-Start from `configs/experiment.yaml`, then replace the dataset paths, PROB checkout
-path, checkpoint path, and exact unknown-class list for the OWOD task/protocol being
-run. The sample file intentionally does not guess protocol-specific unknown classes.
+Named here so nobody looks for it: PROB training and evaluation (external, and the
+official evaluator remains the only source of known mAP, U-Recall, WI and A-OSE);
+incremental retraining and per-group forgetting; the closed A→B feedback loop; LVIS
+confirmation; and the acquisition half of the representation experiment, which finished
+only for the baseline space (`docs/results.md` §11).

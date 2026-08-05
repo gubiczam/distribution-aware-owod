@@ -83,3 +83,51 @@ def test_class_groups_cover_head_medium_and_tail() -> None:
     assert rows, "class groups CSV is empty"
     assert {row["group"] for row in rows} == {"head", "medium", "tail"}
     assert len({row["class_name"] for row in rows}) == len(rows), "duplicate class in mapping"
+
+
+# --- notebooks ----------------------------------------------------------------
+
+NOTEBOOKS = sorted((REPO_ROOT / "notebooks").glob("*.ipynb"))
+
+
+def test_the_repository_ships_one_notebook_per_contribution() -> None:
+    assert [path.name for path in NOTEBOOKS] == [
+        "contribution_a_colab.ipynb",
+        "contribution_b_colab.ipynb",
+    ]
+
+
+@pytest.mark.parametrize("path", NOTEBOOKS, ids=lambda path: path.name)
+def test_notebook_is_valid_and_thin(path: Path) -> None:
+    """A notebook must be valid JSON, small, and free of stored outputs.
+
+    Thin matters: the previous generation embedded its outputs, which made the JSON
+    unreviewable and let a notebook disagree with the library it was supposed to
+    drive. These are shims over experiments/, so they stay short and output-free.
+    """
+
+    import json
+
+    notebook = json.loads(path.read_text(encoding="utf-8"))
+    assert notebook["nbformat"] == 4
+    cells = notebook["cells"]
+    assert len(cells) <= 15, f"{path.name} has {len(cells)} cells; it should be a shim"
+    for index, cell in enumerate(cells):
+        assert cell.get("id"), f"{path.name} cell {index} has no id"
+        assert cell["cell_type"] in {"markdown", "code"}
+        if cell["cell_type"] == "code":
+            assert not cell.get("outputs"), f"{path.name} cell {index} has stored outputs"
+            assert cell.get("execution_count") is None
+
+
+def test_notebooks_reference_only_paths_that_exist() -> None:
+    """Catches a rename that left a notebook pointing at a deleted script."""
+
+    import json
+    import re
+
+    for path in NOTEBOOKS:
+        text = json.dumps(json.loads(path.read_text(encoding="utf-8")))
+        for reference in sorted(set(re.findall(r"(?:experiments|configs|docs)/[\w./-]+", text))):
+            target = reference.rstrip(".,)")
+            assert (REPO_ROOT / target).exists(), f"{path.name} references missing {target}"
