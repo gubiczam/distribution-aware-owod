@@ -14,6 +14,7 @@ only the bridge-exported pool can answer.
 
 import numpy as np
 import pytest
+from fixtures import simulate_pool, structured_regime_pool
 
 from daowod import components
 from daowod.diagnostics import (
@@ -29,7 +30,6 @@ from daowod.diagnostics import (
 )
 from daowod.groups import ClassGroups
 from daowod.scoring import STRATEGY_REGISTRY, score_pool, select_images
-from daowod.simulation import simulate_pool, structured_regime_pool
 
 # One well-formed tail class (6 proposals), one big head class, plus genuinely
 # isolated proposals. Every class has the same intra-class spread.

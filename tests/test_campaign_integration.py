@@ -20,13 +20,13 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from fixtures import simulate_pool
 
 from daowod.cli import main as cli_main
 from daowod.config import load_config
 from daowod.diagnostics import GROUND_TRUTH_FIELDS
 from daowod.experiment import ActiveLearningCampaign, derive_pool_seed, derive_seed
 from daowod.prob_adapter import ProposalBatch
-from daowod.simulation import simulate_pool
 
 UNKNOWN_CLASSES = [f"task_class_{index:02d}" for index in range(6)]
 KNOWN_CLASSES = ["car", "person"]

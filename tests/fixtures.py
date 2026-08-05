@@ -1,11 +1,19 @@
-"""A PROB-calibrated synthetic candidate pool.
+"""Deterministic synthetic candidate pool. **Test fixture only.**
 
-Purpose and limits, stated up front: this simulator exists to (a) unit-test the
-*intended* interaction semantics of rarity and coherence, (b) exercise the full
-pipeline deterministically without a GPU, and (c) show exactly what the
-diagnostics will report. It is **not** evidence about the real M-OWODB pool.
-Every real-pool verdict must come from proposals exported by the bridge from a
-real checkpoint.
+> **This file produces no scientific evidence, and no number derived from it may
+> appear in `docs/results.md`.** It lives under `tests/` for that reason: it used
+> to sit in `src/daowod/`, where its output was reported as though it described
+> the real pool. Two documents built on it were withdrawn in the refactor. Every
+> claim about a real pool must come from proposals exported by the PROB bridge
+> from a real checkpoint — see `docs/reproduction.md`.
+
+What it is for: (a) unit-testing the *intended* interaction semantics of rarity
+and coherence, where a hand-built regime is the only way to state the expected
+ordering; and (b) exercising the pipeline deterministically without a GPU.
+
+The pool is calibrated to a real PROB Task-1 checkpoint sample so the fixture
+exercises realistic value ranges rather than arbitrary ones. Calibration makes the
+*test* meaningful; it does not make the *output* a measurement.
 
 Calibration comes from a real PROB Task-1 checkpoint sample recorded in
 ``PROB/results/trained_checkpoint_smoke/diagnostics.json``:
