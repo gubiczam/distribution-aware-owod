@@ -56,6 +56,30 @@ run:
 mode: MAIN
 
 modes:
+  SMOKE:
+    description: >-
+      Smallest run that touches real data at all: one seed, one round, two budgets,
+      no pilot and no ablations. It exists to prove the installation, the assets and
+      the plumbing, and it is NOT a research result. The evaluation pool stays at 200
+      images because below roughly 150 the reachable tail group falls under four
+      objects and no severity axis is expressible, so a smaller run would stop at
+      severity validation instead of exercising the stages after it.
+    evaluation_images: 200
+    pilot_images: 0
+    reference_images: 100
+    per_image_limit: 8
+    budgets: [10, 25]
+    rounds: 1
+    seeds: [0]
+    strategies: primary
+    severity_axis: flattening
+    run_pilot: false
+    run_ablations: false
+    ablation_seeds: [0]
+    reference_limit: 2000
+    runtime_budget_hours: 0.5
+    research_grade: false
+
   DEBUG:
     description: >-
       Smallest run that exercises every stage end to end. Not a research result:

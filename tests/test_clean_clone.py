@@ -91,8 +91,15 @@ NOTEBOOKS = sorted((REPO_ROOT / "notebooks").glob("*.ipynb"))
 
 
 def test_the_repository_ships_one_notebook_per_contribution() -> None:
+    """One authoritative notebook per contribution, and no superseded generations.
+
+    The Contribution A notebook is the master Colab entrypoint; the shim it replaced
+    was deleted rather than left beside it, because two notebooks for one experiment
+    is how they drift apart.
+    """
+
     assert [path.name for path in NOTEBOOKS] == [
-        "contribution_a_colab.ipynb",
+        "contribution_a_master_colab.ipynb",
         "contribution_b_colab.ipynb",
     ]
 
@@ -111,7 +118,12 @@ def test_notebook_is_valid_and_thin(path: Path) -> None:
     notebook = json.loads(path.read_text(encoding="utf-8"))
     assert notebook["nbformat"] == 4
     cells = notebook["cells"]
-    assert len(cells) <= 15, f"{path.name} has {len(cells)} cells; it should be a shim"
+    # The master notebook is a research document with a section per stage; the
+    # Contribution B notebook is a shim. Both must stay free of stored outputs, and
+    # neither may reimplement the science - tests/test_master_notebook.py asserts that
+    # directly for the master.
+    limit = 45 if "master" in path.name else 15
+    assert len(cells) <= limit, f"{path.name} has {len(cells)} cells, limit {limit}"
     for index, cell in enumerate(cells):
         assert cell.get("id"), f"{path.name} cell {index} has no id"
         assert cell["cell_type"] in {"markdown", "code"}

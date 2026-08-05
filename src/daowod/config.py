@@ -219,15 +219,27 @@ def load_modes(path: str | Path | None = None) -> dict[str, ExecutionMode]:
     return dict(MODES)
 
 
+def normalise_mode_name(name: str) -> str:
+    """Canonical mode key: upper-case, underscores and hyphens removed.
+
+    So ``MAIN_REVEALED``, ``main-revealed`` and ``MAINREVEALED`` are one mode. The
+    separator is cosmetic and a run must not silently fall through to a *different*
+    protocol because a caller typed it differently.
+    """
+
+    return str(name).strip().upper().replace("_", "").replace("-", "")
+
+
 def resolve_mode(name: str) -> ExecutionMode:
-    """Look up a mode by name, case-insensitively, loading the default file once."""
+    """Look up a mode by name, ignoring case and separators; loads the default file once."""
 
     if not MODES:
         load_config()
-    key = str(name).strip().upper()
-    if key not in MODES:
+    key = normalise_mode_name(name)
+    lookup = {normalise_mode_name(declared): declared for declared in MODES}
+    if key not in lookup:
         raise ModeError(f"Unknown execution mode {name!r}. Supported: {sorted(MODES)}")
-    return MODES[key]
+    return MODES[lookup[key]]
 
 
 def register(mode: ExecutionMode, *, replace_existing: bool = False) -> ExecutionMode:
