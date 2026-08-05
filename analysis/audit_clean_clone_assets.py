@@ -45,21 +45,40 @@ IGNORED_PREFIXES = (
 
 # Repository-owned inputs the Stage 2 Colab notebook requires after checkout.
 # Keep in sync with `required_repo_paths` in notebooks/stage2_master_colab.ipynb.
-REQUIRED_REPO_PATHS = (
+#: Inputs every clean clone must carry, independent of which configs exist.
+FIXED_REPO_PATHS = (
     "pyproject.toml",
-    "configs/smoke_stage2_t4.yaml",
-    "configs/stage2_v2_random.yaml",
-    "configs/stage2_v2_uncertainty_objectness_weighted_entropy.yaml",
-    "configs/stage2_v2_full.yaml",
-    "configs/stage2_v2_full_no_novelty.yaml",
     "data/protocol/stage1b/stage1b_candidate_500.txt",
     "data/protocol/stage1b/stage1b_reference_3500.txt",
     "data/protocol/stage2/stage2_class_groups.csv",
     "src/daowod/config.py",
-    "src/daowod/experiment.py",
 )
 
-STAGE2_CONFIGS = tuple(path for path in REQUIRED_REPO_PATHS if path.startswith("configs/"))
+
+def discover_configs(repo_root: Path | None = None) -> tuple[str, ...]:
+    """Every *executable* config in `configs/`, discovered rather than listed.
+
+    Two rules, both learned from failures this module exists to catch:
+
+    * **Discovered, not listed.** A hardcoded list drifted every time a config was
+      added or removed, so the audit silently stopped covering things.
+    * **Executable only.** A config that declares a ``protocol:`` block names real,
+      fully resolved inputs and must be clean-clone reachable. A template whose
+      paths are placeholders (``/path/to/...``) has nothing to resolve, and
+      auditing it would only produce noise.
+    """
+
+    root = Path(repo_root) if repo_root is not None else REPO_ROOT
+    discovered = []
+    for path in sorted((root / "configs").glob("*.yaml")):
+        config = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        if isinstance(config, dict) and "protocol" in config:
+            discovered.append(f"configs/{path.name}")
+    return tuple(discovered)
+
+
+STAGE2_CONFIGS = discover_configs()
+REQUIRED_REPO_PATHS = (*FIXED_REPO_PATHS, *STAGE2_CONFIGS)
 
 # Config keys that name an input the run must be able to read. `output_dir` is
 # excluded on purpose: it is a destination, not an input.

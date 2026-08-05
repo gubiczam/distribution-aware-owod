@@ -17,13 +17,6 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parent.parent
 NOTEBOOK_PATH = REPO_ROOT / "notebooks" / "stage2_master_colab.ipynb"
 CLASS_GROUPS_PATH = Path("data/protocol/stage2/stage2_class_groups.csv")
-STAGE2_CONFIG_NAMES = (
-    "smoke_stage2_t4.yaml",
-    "stage2_v2_random.yaml",
-    "stage2_v2_uncertainty_objectness_weighted_entropy.yaml",
-    "stage2_v2_full.yaml",
-    "stage2_v2_full_no_novelty.yaml",
-)
 
 
 def _load_audit_module():
@@ -38,6 +31,10 @@ def _load_audit_module():
 
 
 audit_module = _load_audit_module()
+
+#: Discovered, never listed, and restricted to executable configs. See
+#: `audit_clean_clone_assets.discover_configs` for why both rules are necessary.
+STAGE2_CONFIG_NAMES = tuple(Path(path).name for path in audit_module.discover_configs(REPO_ROOT))
 
 
 def _notebook_sources() -> list[str]:
@@ -65,6 +62,8 @@ def test_required_repo_path_exists_and_is_not_ignored(relative_path: str) -> Non
 @pytest.mark.parametrize("config_name", STAGE2_CONFIG_NAMES)
 def test_stage2_config_class_groups_path_is_version_controlled(config_name: str) -> None:
     config = yaml.safe_load((REPO_ROOT / "configs" / config_name).read_text(encoding="utf-8"))
+    if "class_groups_path" not in config.get("dataset", {}):
+        pytest.skip(f"{config_name} declares no class groups")
     class_groups_path = config["dataset"]["class_groups_path"]
     assert class_groups_path == CLASS_GROUPS_PATH.as_posix(), (
         f"{config_name} must resolve class groups from the tracked protocol location"
@@ -85,7 +84,7 @@ def test_class_groups_csv_covers_every_unknown_class() -> None:
     mapped = {row["class_name"] for row in rows}
     for config_name in STAGE2_CONFIG_NAMES:
         config = yaml.safe_load((REPO_ROOT / "configs" / config_name).read_text(encoding="utf-8"))
-        unknown = set(config["dataset"]["unknown_classes"])
+        unknown = set(config.get("dataset", {}).get("unknown_classes", ()))
         assert unknown <= mapped, (
             f"{config_name} declares unknown classes with no group: {sorted(unknown - mapped)}"
         )

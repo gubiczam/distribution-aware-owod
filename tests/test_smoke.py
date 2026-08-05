@@ -570,15 +570,12 @@ def test_stage2_configs_use_version_controlled_stage1b_splits() -> None:
     assert file_sha256(candidate) == STAGE1B_CANDIDATE_SHA256
     assert file_sha256(reference) == STAGE1B_REFERENCE_SHA256
 
-    config_paths = [
-        REPO_ROOT / "configs/smoke_stage2_t4.yaml",
-        REPO_ROOT / "configs/stage2_v2_random.yaml",
-        REPO_ROOT / "configs/stage2_v2_uncertainty_objectness_weighted_entropy.yaml",
-        REPO_ROOT / "configs/stage2_v2_full.yaml",
-        REPO_ROOT / "configs/stage2_v2_full_no_novelty.yaml",
-    ]
+    config_paths = sorted((REPO_ROOT / "configs").glob("*.yaml"))
+    assert config_paths, "no configs found to check"
     for path in config_paths:
         config = yaml.safe_load(path.read_text(encoding="utf-8"))
+        if "protocol" not in config:
+            continue
         assert Path(config["protocol"]["candidate_pool_split"]) == STAGE1B_CANDIDATE_SPLIT
         assert Path(config["protocol"]["reference_split"]) == STAGE1B_REFERENCE_SPLIT
         assert Path(config["dataset"]["image_set_path"]) == STAGE1B_CANDIDATE_SPLIT
