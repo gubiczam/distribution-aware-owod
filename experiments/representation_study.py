@@ -1,6 +1,6 @@
 """Representation Experiment E4, Phase 5: the same strategies, a different space.
 
-    python analysis/run_e4_active_learning.py \\
+    python experiments/representation_study.py \\
         --export outputs/real_stage1/reference_proposals.npz \\
         --annotations ~/owod_stage/Annotations \\
         --representations outputs/e4_representations \\

@@ -225,7 +225,7 @@ def test_crop_spaces_are_reported_unavailable_without_extraction(tmp_path) -> No
         row["name"]: row for row in representations.audit_rows(export=export, directory=tmp_path)
     }
     assert rows["dino_resnet50"]["available"] is False
-    assert "extract_region_embeddings" in str(rows["dino_resnet50"]["blocked_by"])
+    assert "extract_embeddings" in str(rows["dino_resnet50"]["blocked_by"])
 
 
 def test_derived_transforms_are_deterministic_and_shape_preserving() -> None:

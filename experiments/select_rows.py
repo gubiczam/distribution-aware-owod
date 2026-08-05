@@ -8,8 +8,8 @@ detector's objectness and boxes alone — never of the embeddings — so they ar
 identical for every representation, and restricting extraction to them changes
 nothing about the experiment while making it five times cheaper.
 
-The row list is written out and consumed by ``analysis/extract_region_embeddings.py``
-through ``--rows``. ``analysis/experiment_e4_representations.py`` then *verifies*
+The row list is written out and consumed by ``experiments/extract_embeddings.py``
+through ``--rows``. ``experiments/representation_geometry.py`` then *verifies*
 that every row it actually reads was extracted, so the saving is a checked
 precondition rather than an assumption.
 """

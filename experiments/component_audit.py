@@ -2,7 +2,7 @@
 
 Run from the repository root:
 
-    python analysis/audit_coherence_failure.py \\
+    python experiments/component_audit.py \\
         --export outputs/real_stage1/reference_proposals.npz \\
         --annotations ~/owod_stage/Annotations \\
         --output outputs/audit_contribution_a

@@ -15,7 +15,7 @@ Three kinds of space
     other space is measured against.
 
 ``crop``
-    Produced by ``analysis/extract_region_embeddings.py``, which re-embeds the same
+    Produced by ``experiments/extract_embeddings.py``, which re-embeds the same
     predicted boxes with an encoder trained under a different objective. Requires a
     torch environment, so it runs as a subprocess and lands as an NPZ that this
     module only reads.
@@ -114,14 +114,14 @@ REGISTRY: tuple[RepresentationSpec, ...] = (
         kind="crop",
         description="Self-supervised DINO ResNet-50 pooled features over the "
         "cropped predicted region, 2048-d.",
-        source="analysis/extract_region_embeddings.py",
+        source="experiments/extract_embeddings.py",
     ),
     RepresentationSpec(
         name="imagenet_resnet50",
         kind="crop",
         description="Supervised ImageNet ResNet-50 pooled features over the same "
         "crops, 2048-d. The closed-set-supervision control.",
-        source="analysis/extract_region_embeddings.py",
+        source="experiments/extract_embeddings.py",
     ),
     RepresentationSpec(
         name="prob_decoder_whitened",
@@ -212,8 +212,7 @@ def _require(
         path = Path(directory) / f"{spec.name}.npz"
         if not path.exists():
             raise RepresentationError(
-                f"{spec.name}: {path} does not exist. Run "
-                "analysis/extract_region_embeddings.py first."
+                f"{spec.name}: {path} does not exist. Run experiments/extract_embeddings.py first."
             )
         return
     _require(resolve(spec.base), export=export, directory=directory)

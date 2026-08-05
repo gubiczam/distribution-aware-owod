@@ -1,6 +1,6 @@
 """Representation Experiment E4, Phases 1-4 and 6: compare feature spaces.
 
-    python analysis/experiment_e4_representations.py \\
+    python experiments/representation_geometry.py \\
         --export outputs/real_stage1/reference_proposals.npz \\
         --annotations ~/owod_stage/Annotations \\
         --representations outputs/e4_representations \\
@@ -11,11 +11,11 @@ experiments used — and for each available feature space measures the geometry
 statistics the coherence gate depends on, then draws the projections.
 
 This script does not touch the baseline and does not run any acquisition strategy;
-Phase 5 lives in ``analysis/run_e4_active_learning.py`` so that the cheap geometry
+Phase 5 lives in ``experiments/representation_study.py`` so that the cheap geometry
 comparison and the expensive campaign comparison can be run and re-run
 independently.
 
-It reads ground truth throughout. Like ``analysis/audit_coherence_failure.py`` it is
+It reads ground truth throughout. Like ``experiments/component_audit.py`` it is
 an analysis of a finished experiment, never part of an acquisition path.
 """
 

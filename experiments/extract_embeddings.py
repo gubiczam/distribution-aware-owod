@@ -6,7 +6,7 @@ only interpreter on this machine that has torch is the PROB checkout's virtual
 environment. The boundary is therefore the same one `daowod.detector` uses for
 the detector — a subprocess that writes an NPZ the library then reads:
 
-    ~/Documents/PROB/.venv/bin/python analysis/extract_region_embeddings.py \\
+    ~/Documents/PROB/.venv/bin/python experiments/extract_embeddings.py \\
         --export outputs/real_stage1/reference_proposals.npz \\
         --images ~/owod_stage/JPEGImages \\
         --output outputs/e4_representations \\
@@ -99,7 +99,7 @@ def parse_args() -> argparse.Namespace:
         "--rows",
         default="",
         help="Optional .npy of export-row indices to embed. Produced by "
-        "analysis/e4_required_rows.py; restricts work to the rows the experiment "
+        "experiments/select_rows.py; restricts work to the rows the experiment "
         "actually reads, which is checked downstream rather than assumed.",
     )
     parser.add_argument("--device", default="mps")
