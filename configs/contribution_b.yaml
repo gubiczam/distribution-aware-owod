@@ -1,0 +1,46 @@
+# Contribution B — distribution-aware exemplar allocation.
+#
+# SCOPE. This configures the allocation MATHEMATICS only. It produces the exemplar
+# buffers that an alpha sweep would use; it does not measure their effect. The
+# research question — what alpha is optimal in OWOD and how that optimum moves with
+# tail severity (H-B1) — needs real incremental model updates with PROB retraining
+# and per-group forgetting measured across tasks. That is a separate, documented
+# future step; see docs/research_design.md section 8.
+#
+# Nothing here trains, evaluates, or estimates forgetting. There is deliberately no
+# offline proxy for it, because a proxy would not answer the question: forgetting is
+# a property of a trained model, not of a buffer.
+
+allocation:
+  # Total memory. At granularity `object` this counts stored objects; at `image` it
+  # counts stored images, because one image brings all of its objects with it.
+  total_memory: 200
+
+  # m_c proportional to n_c ** alpha, sum(m_c) = M.
+  #   alpha =  0  uniform, the current standard
+  #   alpha =  1  proportional to class size, head-favouring
+  #   alpha <  0  tail-favouring
+  # Values are explicit: the sweep reports exactly this grid and no other.
+  alphas: [-1.0, -0.5, 0.0, 0.5, 1.0]
+
+  # `object` splits the budget over per-class object counts. `image` selects whole
+  # images, which cannot satisfy every per-class quota at once — that ambiguity is
+  # what H-B2 names — so the residual is reported per class rather than hidden.
+  granularity: object
+
+  # Refuse to allot a class more exemplars than it actually has, and redistribute
+  # the freed budget. This binds exactly where Contribution B is interesting: at
+  # alpha < 0 a two-object tail class is otherwise allotted far more than two.
+  respect_availability: true
+
+# Where the class counts come from. Supply one of the two.
+source:
+  # A CSV with `class_name,count` columns.
+  class_counts_csv: ""
+
+  # Or derive counts from real VOC annotations over a split, which is what makes the
+  # numbers describe an actual OWOD task rather than a hypothetical table.
+  annotations_dir: ""
+  split_file: ""
+
+output_dir: outputs/contribution_b
