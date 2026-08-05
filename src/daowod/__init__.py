@@ -1,41 +1,18 @@
-"""Distribution-aware active learning for Open-World Object Detection."""
+"""Distribution-aware active annotation for Open-World Object Detection.
 
-from daowod.acquisition import compare_acquisition_strategies
-from daowod.config import ExperimentConfig, load_config
-from daowod.diagnostics import component_diagnostics, proposal_table, uncertainty_comparison
-from daowod.experiment import (
-    ActiveLearningCampaign,
-    ExperimentResult,
-    RoundResult,
-    run_active_round,
-)
-from daowod.groups import ClassGroups
-from daowod.prob_adapter import ProbAdapter, ProposalBatch
-from daowod.scoring import (
-    REQUIRED_STRATEGIES,
-    STRATEGY_REGISTRY,
-    StrategySpec,
-    score_pool,
-    select_images,
-)
+**This package deliberately re-exports nothing.** Import the module you need:
 
-__all__ = [
-    "REQUIRED_STRATEGIES",
-    "STRATEGY_REGISTRY",
-    "ActiveLearningCampaign",
-    "ClassGroups",
-    "ExperimentConfig",
-    "ExperimentResult",
-    "ProbAdapter",
-    "ProposalBatch",
-    "RoundResult",
-    "StrategySpec",
-    "compare_acquisition_strategies",
-    "component_diagnostics",
-    "load_config",
-    "proposal_table",
-    "run_active_round",
-    "score_pool",
-    "select_images",
-    "uncertainty_comparison",
-]
+    from daowod import scoring, components      # equation (1)
+    from daowod import annotation, study        # Contribution A
+    from daowod import memory                   # Contribution B
+
+The previous version eagerly imported seven modules here, which meant any
+`from daowod import x` pulled in the legacy scorer, the synthetic diagnostics and
+the image-level campaign. Every usage analysis therefore reported that dead code
+as live, and the two research programs could never be separated. Keeping this file
+empty is what makes the module boundaries real rather than nominal.
+
+See `docs/research_design.md` for the architecture contract.
+"""
+
+__all__: list[str] = []
