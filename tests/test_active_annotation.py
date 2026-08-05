@@ -23,11 +23,11 @@ import pytest
 from daowod import (
     annotation,
     candidates,
+    config,
     detector,
     discovery,
     figures,
     longtail,
-    modes,
     oracle,
     pipeline,
     study,
@@ -564,26 +564,30 @@ def test_aggregation_reports_nan_sd_for_a_single_seed() -> None:
 # --------------------------------------------------------------------------
 
 
-def test_every_mode_is_internally_consistent() -> None:
-    for name in modes.MODE_NAMES:
-        mode = modes.resolve_mode(name)
+def test_every_declared_mode_is_internally_consistent() -> None:
+    """Every mode in configs/contribution_a.yaml must validate, not just MAIN."""
+
+    declared = config.load_modes()
+    assert set(declared) >= {"DEBUG", "FAST", "MAIN", "MAINREVEALED"}
+    for name in sorted(declared):
+        mode = config.resolve_mode(name)
         assert mode.total_images > 0
         assert mode.study_config().strategies == mode.strategies
         assert len(mode.imbalance_settings) >= 2
-    assert modes.resolve_mode("main").name == "MAIN"
-    with pytest.raises(modes.ModeError):
-        modes.resolve_mode("HUGE")
+    assert config.resolve_mode("main").name == "MAIN"
+    with pytest.raises(config.ModeError):
+        config.resolve_mode("HUGE")
 
 
 def test_main_mode_targets_the_five_required_strategies() -> None:
-    mode = modes.resolve_mode("MAIN")
+    mode = config.resolve_mode("MAIN")
     assert mode.strategies == study.PRIMARY_STRATEGIES
     assert len(mode.strategies) == 5
     assert mode.research_grade is True
 
 
 def test_a_fitting_estimate_reports_runtime_disk_and_memory() -> None:
-    mode = modes.resolve_mode("MAIN")
+    mode = config.resolve_mode("MAIN")
     estimate = pipeline.estimate_cost(
         mode=mode,
         seconds_per_image=0.001,
@@ -611,7 +615,7 @@ def test_an_over_budget_estimate_refuses_and_never_shrinks_the_pool() -> None:
     estimate is now inert: it reports and refuses.
     """
 
-    mode = modes.resolve_mode("MAIN")
+    mode = config.resolve_mode("MAIN")
     estimate = pipeline.estimate_cost(
         mode=mode,
         seconds_per_image=1.0,
@@ -631,7 +635,7 @@ def test_an_over_budget_estimate_refuses_and_never_shrinks_the_pool() -> None:
 
 def test_a_zero_budget_means_unbounded_rather_than_impossible() -> None:
     estimate = pipeline.estimate_cost(
-        mode=modes.resolve_mode("MAIN"),
+        mode=config.resolve_mode("MAIN"),
         seconds_per_image=1.0,
         seconds_per_cell=1e6,
         measured_pool_size=1000,

@@ -1,0 +1,146 @@
+# Contribution A — distribution-aware active annotation.
+#
+# This file IS the protocol. A mode fixes every quantity that trades runtime
+# against statistical power: how many images are inferred, how many proposals per
+# image survive the candidate filter, the annotation budget grid, the round count,
+# the seeds, the arms, and which severity axis is used. Changing any of them
+# changes what the numbers mean, so they live in version control rather than in
+# Python constants or a notebook cell.
+#
+# `research_grade: false` marks a mode whose numbers must not be reported.
+#
+# Sizes are not arbitrary. Measured on the real S-OWODB / OWDETR Task-1 export at
+# 100 queries per image and per_image_limit 20:
+#
+#     500 images -> 10 000 candidates,  104 reachable unknown objects, tail 8
+#   2 400 images -> 48 000 candidates,  364 reachable unknown objects, tail 26
+#   3 500 images -> 70 000 candidates,  508 reachable unknown objects, tail 25
+#
+# A tail group of 8 objects shows a trend and cannot resolve one; below about 150
+# evaluation images no severity axis is expressible at all and the run stops at
+# severity validation. See docs/reproduction.md sections 8 and 9.
+
+# Paths and protocol constants. These are the only lines a new run must edit.
+run:
+  data_root: /content/owod_stage
+  split_file: ""
+  prob_repository: /content/PROB
+  checkpoint: ""
+  output_dir: /content/daowod_results
+  cache_dir: /content/daowod_cache
+  existing_export: ""
+  expected_checkpoint_sha256: ""
+
+  # Frozen S-OWODB / OWDETR Task-1 settings. A mismatch here changes the
+  # scientific meaning of the run; see docs/reproduction.md section 1.
+  dataset: OWDETR
+  previous_introduced_classes: 0
+  current_introduced_classes: 19
+  num_classes: 81
+  objectness_temperature: 1.0
+  max_proposals_per_image: 100
+  iou_threshold: 0.5
+
+  device: cuda
+  require_gpu: true
+  batch_size: 2
+  num_workers: 2
+  chunk_images: 250
+  seed: 0
+  target_tail_recall: 0.5
+
+  # The preflight estimate refuses to start when the projection exceeds this.
+  # It never shrinks the pool to fit; see pipeline.RuntimeBudgetExceeded.
+  runtime_budget_hours: 0.0
+
+mode: MAIN
+
+modes:
+  DEBUG:
+    description: >-
+      Smallest run that exercises every stage end to end. Not a research result:
+      two seeds and a 200-image evaluation pool cannot separate strategies.
+    evaluation_images: 200
+    pilot_images: 60
+    reference_images: 150
+    per_image_limit: 12
+    budgets: [25, 50, 100]
+    rounds: 2
+    seeds: [0, 1]
+    strategies: primary
+    severity_axis: flattening
+    run_pilot: true
+    run_ablations: true
+    ablation_seeds: [0]
+    reference_limit: 4000
+    runtime_budget_hours: 0.25
+    research_grade: false
+
+  FAST:
+    description: >-
+      Under-powered but real: all five strategies and both severities on a
+      500-image evaluation pool with two seeds. Confirms the sign of the
+      contrast; report it as a pilot, never as the headline.
+    evaluation_images: 500
+    pilot_images: 150
+    reference_images: 350
+    per_image_limit: 20
+    budgets: [50, 100, 200, 400]
+    rounds: 4
+    seeds: [0, 1]
+    strategies: primary
+    severity_axis: flattening
+    run_pilot: true
+    run_ablations: true
+    ablation_seeds: [0]
+    reference_limit: 10000
+    runtime_budget_hours: 1.0
+    research_grade: false
+
+  MAIN:
+    description: >-
+      The reported experiment, sized for one NVIDIA T4 in about four to five
+      hours: 4 000 inferred images split into disjoint reference / pilot /
+      evaluation pools, five strategies, three severities, three seeds, plus the
+      ablation grid.
+    evaluation_images: 2400
+    pilot_images: 600
+    reference_images: 1000
+    per_image_limit: 20
+    budgets: [100, 250, 500, 1000, 2000]
+    rounds: 5
+    seeds: [0, 1, 2]
+    strategies: primary
+    severity_axis: default
+    run_pilot: true
+    run_ablations: true
+    ablation_seeds: [0, 1]
+    reference_limit: 20000
+    runtime_budget_hours: 4.5
+    research_grade: true
+
+  MAINREVEALED:
+    # The label-anchored follow-up. Same MAIN protocol with the anchored arms and
+    # the free informativeness-prior control added beside the untouched baseline,
+    # so every arm shares one pool, one severity axis, one seed set and one budget
+    # grid. Ablations are off because the anchored variants ARE the ablation
+    # (support only / rarity ungated / gated), and the baseline's gate-form grid
+    # was measured in the first run.
+    description: >-
+      Label-anchored distribution estimation versus the unsupervised baseline on
+      one shared MAIN-scale pool: 11 strategies x 3 severities x 3 seeds.
+    evaluation_images: 2400
+    pilot_images: 600
+    reference_images: 1000
+    per_image_limit: 20
+    budgets: [100, 250, 500, 1000, 2000]
+    rounds: 5
+    seeds: [0, 1, 2]
+    strategies: comparison
+    severity_axis: default
+    run_pilot: true
+    run_ablations: false
+    ablation_seeds: [0, 1]
+    reference_limit: 20000
+    runtime_budget_hours: 4.5
+    research_grade: true

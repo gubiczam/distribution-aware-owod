@@ -21,8 +21,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from daowod import longtail, modes
-from daowod.modes import ExecutionMode
+from daowod import config as config_module
+from daowod import longtail
+from daowod.config import ExecutionMode
 from daowod.pipeline import PipelineConfig, PipelineError, run_pipeline
 from daowod.study import PRIMARY_STRATEGIES
 
@@ -188,7 +189,7 @@ TEST_MODE = ExecutionMode(
 
 @pytest.fixture(scope="module")
 def registered_mode() -> ExecutionMode:
-    return modes.register(TEST_MODE, replace_existing=True)
+    return config_module.register(TEST_MODE, replace_existing=True)
 
 
 @pytest.fixture(scope="module")
@@ -409,7 +410,7 @@ def test_a_missing_export_image_is_reported_not_silently_dropped(
 ) -> None:
     root, export, split = fixture_paths
     bigger = replace(TEST_MODE, name="PYTESTBIG", evaluation_images=200)
-    modes.register(bigger, replace_existing=True)
+    config_module.register(bigger, replace_existing=True)
     config = PipelineConfig(
         mode="PYTESTBIG",
         data_root=str(root),
@@ -422,3 +423,20 @@ def test_a_missing_export_image_is_reported_not_silently_dropped(
     with pytest.raises((PipelineError, Exception)) as error:
         run_pipeline(config, progress=None)
     assert "images" in str(error.value).lower() or "lists only" in str(error.value)
+
+
+def test_required_artifact_names_are_well_formed() -> None:
+    """A refactor once turned "preflight.csv" into "csv" and every test still passed.
+
+    The pipeline verifies that each REQUIRED_ARTIFACTS entry exists, so a mangled
+    name is self-consistent: the run writes the wrong filename and then happily
+    finds it. Only the names themselves catch that.
+    """
+
+    from daowod.pipeline import REQUIRED_ARTIFACTS
+
+    for name in REQUIRED_ARTIFACTS:
+        stem, _, suffix = name.rpartition(".")
+        assert suffix in {"csv", "json", "md", "png"}, name
+        assert stem, f"{name!r} has no stem, only an extension"
+        assert len(stem) > 2, f"{name!r} looks truncated"

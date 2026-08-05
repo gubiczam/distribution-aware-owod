@@ -33,8 +33,8 @@ from pathlib import Path
 
 import numpy as np
 
-from daowod import modes, representations, study, tables
-from daowod.modes import resolve_mode
+from daowod import config, representations, study, tables
+from daowod.config import resolve_mode
 from daowod.pipeline import PipelineConfig, run_pipeline
 
 #: The arms Phase 5 runs. Deliberately smaller than the eleven-arm follow-up: the
@@ -75,7 +75,7 @@ def register_mode(base_name: str) -> None:
     """The E4 mode: the base protocol with the six-arm set and no ablation grid."""
 
     base = resolve_mode(base_name)
-    modes.register(
+    config.register(
         replace(
             base,
             name=E4_MODE_NAME,

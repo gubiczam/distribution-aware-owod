@@ -38,7 +38,7 @@ from daowod import (
     study,
     tables,
 )
-from daowod.modes import resolve_mode
+from daowod.config import resolve_mode
 
 
 def parse_args() -> argparse.Namespace:

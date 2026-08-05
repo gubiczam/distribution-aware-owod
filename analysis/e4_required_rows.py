@@ -23,7 +23,7 @@ from pathlib import Path
 import numpy as np
 
 from daowod import candidates, detector, study
-from daowod.modes import resolve_mode
+from daowod.config import resolve_mode
 
 
 def parse_args() -> argparse.Namespace:

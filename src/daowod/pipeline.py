@@ -34,16 +34,16 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 
 import numpy as np
 from numpy.typing import NDArray
 
-from daowod import detector, discovery, figures, longtail, modes, oracle, study, tables
+from daowod import config, detector, discovery, figures, longtail, oracle, study, tables
 from daowod.annotation import run_campaign
+from daowod.config import ExecutionMode
 from daowod.longtail import resolve_budgets
-from daowod.modes import ExecutionMode
 from daowod.oracle import ClassGroups
 from daowod.scoring import STRATEGY_REGISTRY
 from daowod.study import PreparedPool, StudyConfig, StudyOutputs
@@ -87,7 +87,7 @@ REQUIRED_ARTIFACTS: tuple[str, ...] = (
     "class_frequency.csv",
     "headline_contrasts.csv",
     "cost_to_target.csv",
-    "csv",
+    "preflight.csv",
     "run_manifest.json",
     "runtime_plan.json",
     "leakage_report.json",
@@ -147,8 +147,34 @@ class PipelineConfig:
     def annotations_dir(self) -> Path:
         return Path(self.data_root) / "Annotations"
 
+    @classmethod
+    def from_yaml(cls, path: str | Path | None = None, **overrides: object) -> PipelineConfig:
+        """Build a run from `configs/contribution_a.yaml`, registering its modes.
+
+        The YAML is the protocol (see :mod:`daowod.config`); ``overrides`` exist for
+        the paths a Colab session must supply at run time, never for sizes or seeds.
+        Passing a size here would put the protocol back in the caller.
+        """
+
+        info = config.load_config(path)
+        run = dict(info["run"])
+        hours = float(run.pop("runtime_budget_hours", 0.0) or 0.0)
+        settings: dict[str, object] = {
+            "mode": info["mode"],
+            "runtime_budget_seconds": hours * 3600.0,
+            **run,
+            **overrides,
+        }
+        known = {field_.name for field_ in fields(cls)}
+        unknown = sorted(set(settings) - known)
+        if unknown:
+            raise config.ConfigError(
+                f"{info['source']}: unknown run settings {unknown}. Known: {sorted(known)}"
+            )
+        return cls(**settings)  # type: ignore[arg-type]
+
     def execution_mode(self) -> ExecutionMode:
-        mode = modes.resolve_mode(self.mode)
+        mode = config.resolve_mode(self.mode)
         if self.runtime_budget_seconds > 0:
             mode = replace(mode, runtime_budget_seconds=float(self.runtime_budget_seconds))
         return mode
@@ -903,7 +929,7 @@ def run_pipeline(
     _log(progress, f"[1/11] Preflight ({mode.name})")
     checks = stage_preflight(config, mode)
     result.checks = rows(checks)
-    tables.write_csv(output_dir / "csv", result.checks)
+    tables.write_csv(output_dir / "preflight.csv", result.checks)
     result.stage_seconds["preflight"] = round(time.time() - stage_started, 1)
 
     _log(progress, "[2/11] Image splits")
