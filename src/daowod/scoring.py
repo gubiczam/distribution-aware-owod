@@ -527,7 +527,7 @@ def combine_components(
     """The weighted sum. The only place a strategy's arithmetic happens.
 
     ``score_pool`` and the legacy compatibility shim in
-    :mod:`daowod.acquisition` both route through here, so no second copy of the
+    every caller routes through here, so no second copy of the
     formula can drift away from this one.
     """
 

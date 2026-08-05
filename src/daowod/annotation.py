@@ -1,14 +1,18 @@
 """Proposal-level, multi-round offline active-annotation simulation.
 
-Why this is not :mod:`daowod.experiment`
-----------------------------------------
-``experiment.py`` spends an *image* budget and calls PROB to retrain between
-rounds. Contribution A's score ``s(x)`` is defined on a candidate *region*, and
-the quantity the plan wants on the x-axis is annotation cost. One annotated
-region is one unit of oracle work, so the budget here counts proposals and the
-loop never touches a GPU: a single cached PROB export supports every strategy,
-seed and ablation, which is what makes 3 seeds x 5 strategies x 2 severities
-affordable inside a Colab session.
+Why the budget counts regions, not images
+-----------------------------------------
+Contribution A's score ``s(x)`` is defined on a candidate *region*, and the
+quantity the proposal puts on the x-axis is oracle cost. One annotated region is
+one unit of oracle work, so the budget here counts proposals, and the loop never
+touches a GPU: a single cached PROB export supports every strategy, seed and
+ablation, which is what makes 3 seeds x 5 strategies x 3 severities affordable
+inside one Colab session.
+
+An image-level loop that retrained the detector between rounds also existed. It
+was never executed and is deleted; it will be rebuilt when Contribution B enters
+experimental execution and its protocol is fixed. See git tag
+``pre-refactor-snapshot``.
 
 What the oracle may and may not tell the acquisition
 ---------------------------------------------------

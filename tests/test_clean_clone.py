@@ -131,3 +131,62 @@ def test_notebooks_reference_only_paths_that_exist() -> None:
         for reference in sorted(set(re.findall(r"(?:experiments|configs|docs)/[\w./-]+", text))):
             target = reference.rstrip(".,)")
             assert (REPO_ROOT / target).exists(), f"{path.name} references missing {target}"
+
+
+# --- interface surface --------------------------------------------------------
+
+
+def test_the_cli_only_inspects_and_says_so() -> None:
+    """`daowod-run` must not grow experiment subcommands without the docs following.
+
+    The CLI is registry inspection. Experiments live in experiments/, and README and
+    docs/reproduction.md say so explicitly. If a subcommand is added here, those two
+    documents have to change in the same commit.
+    """
+
+    from daowod.cli import build_parser
+
+    actions = [
+        action
+        for action in build_parser()._actions  # noqa: SLF001 - argparse has no public API
+        if hasattr(action, "choices") and action.choices
+    ]
+    assert len(actions) == 1
+    assert set(actions[0].choices) == {"strategies"}
+
+
+def test_documented_commands_match_the_real_interfaces() -> None:
+    """Every documented `experiments/...` invocation must parse.
+
+    docs/reproduction.md once documented a `--stage` flag that did not exist, and
+    nothing caught it because no test read the documentation.
+    """
+
+    import re
+    import subprocess
+    import sys
+
+    text = "\n".join(
+        (REPO_ROOT / name).read_text(encoding="utf-8")
+        for name in ("README.md", "docs/reproduction.md", "docs/artifacts.md")
+    )
+    invocations = set(re.findall(r"python experiments/(\w+\.py)((?:\s+[\w\-./<>\[\]]+)*)", text))
+    assert invocations, "no documented experiment commands found"
+
+    for script, tail in sorted(invocations):
+        assert (REPO_ROOT / "experiments" / script).exists(), script
+        # extract_embeddings needs torch, which this environment deliberately lacks.
+        if script == "extract_embeddings.py":
+            continue
+        subcommand = (
+            [tail.split()[0]] if tail.split() and not tail.split()[0].startswith("-") else []
+        )
+        result = subprocess.run(
+            [sys.executable, f"experiments/{script}", *subcommand, "--help"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, (
+            f"{script} {' '.join(subcommand)} --help failed:\n{result.stderr}"
+        )

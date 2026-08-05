@@ -118,33 +118,43 @@ def build_parser() -> argparse.ArgumentParser:
     study.add_argument("--no-gpu", action="store_true", help="For DEBUG on a CPU machine.")
     study.set_defaults(function=_run_study)
 
-    audit = stages.add_parser("audit", help="Component-level audit of the acquisition signals.")
-    audit.set_defaults(function=lambda args: _delegate("component_audit.py", args.forwarded))
+    # These three stages own their own flags, so this dispatcher must not try to
+    # interpret them. `parse_known_args` in main() collects them and _delegate hands
+    # them over untouched. (argparse.REMAINDER cannot do this: as a positional it
+    # never captures a *leading* option such as `--export`, so the subparser rejects
+    # it before the stage script is ever reached.)
+    audit = stages.add_parser(
+        "audit",
+        help="Component-level audit of the acquisition signals.",
+        add_help=False,
+    )
+    audit.set_defaults(script="component_audit.py")
 
     geometry = stages.add_parser(
-        "representation", help="Feature-space geometry across representations."
+        "representation",
+        help="Feature-space geometry across representations.",
+        add_help=False,
     )
-    geometry.set_defaults(
-        function=lambda args: _delegate("representation_geometry.py", args.forwarded)
-    )
+    geometry.set_defaults(script="representation_geometry.py")
 
     acquisition = stages.add_parser(
         "representation-acquisition",
         help="The same acquisition arms in a different feature space (INCOMPLETE; see "
         "docs/results.md section 11).",
+        add_help=False,
     )
-    acquisition.set_defaults(
-        function=lambda args: _delegate("representation_study.py", args.forwarded)
-    )
-
-    for sub in (audit, geometry, acquisition):
-        sub.add_argument("forwarded", nargs=argparse.REMAINDER, help="Passed to the stage script.")
+    acquisition.set_defaults(script="representation_study.py")
 
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    args, extra = build_parser().parse_known_args(argv)
+    script = getattr(args, "script", "")
+    if script:
+        return _delegate(script, extra)
+    if extra:
+        raise SystemExit(f"unrecognised arguments for `study`: {extra}")
     return int(args.function(args))
 
 

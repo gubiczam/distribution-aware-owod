@@ -164,19 +164,46 @@ Contribution A — the region-level annotation study, the component audit and th
 representation geometry, all from one entrypoint:
 
 ```bash
-python experiments/contribution_a.py --config configs/contribution_a.yaml --stage study
-python experiments/contribution_a.py --config configs/contribution_a.yaml --stage audit
-python experiments/contribution_a.py --config configs/contribution_a.yaml --stage representation
+# the reported experiment; --mode overrides `mode:` in the config
+python experiments/contribution_a.py study \
+    --mode DEBUG --no-gpu \
+    --data-root <data-root> --split <ids>.txt --checkpoint <t1>.pth \
+    --output outputs/contribution_a_debug --cache outputs/cache
+
+# the component audit behind results.md sections 2-5
+python experiments/contribution_a.py audit \
+    --export <frozen-export>.npz --annotations <data-root>/Annotations \
+    --output outputs/audit_contribution_a
+
+# the nine-space geometry comparison behind results.md section 7
+python experiments/contribution_a.py representation \
+    --export <frozen-export>.npz --annotations <data-root>/Annotations \
+    --representations outputs/e4_representations --output outputs/e4_geometry
+
+# the acquisition arms in a different space -- INCOMPLETE, see results.md section 11
+python experiments/contribution_a.py representation-acquisition \
+    --export <frozen-export>.npz --annotations <data-root>/Annotations \
+    --representations outputs/e4_representations --output outputs/e4_active_learning
 ```
 
-Re-embedding the boxes for the representation stage runs **outside** this environment,
+`study` takes only paths: sizes, budgets, rounds, seeds, arms and the severity axis all
+come from the config. Each stage is also runnable directly
+(`python experiments/component_audit.py --help`); the dispatcher forwards its arguments
+untouched.
+
+The representation stages need region embeddings produced **outside** this environment,
 because `daowod` deliberately has no torch dependency and the only interpreter with torch
-is the PROB checkout's:
+is the PROB checkout's. Select the rows first: re-embedding all 400 000 exported rows
+costs about two and a half hours, and only a fraction is ever read.
 
 ```bash
+python experiments/select_rows.py \
+    --export <frozen-export>.npz --output outputs/e4_representations
+
 ~/Documents/PROB/.venv/bin/python experiments/extract_embeddings.py \
     --export <frozen-export>.npz --images <data-root>/JPEGImages \
-    --output outputs/e4_representations
+    --output outputs/e4_representations \
+    --rows outputs/e4_representations/rows.npy
 ```
 
 Contribution B — the allocation core:
@@ -185,8 +212,16 @@ Contribution B — the allocation core:
 python experiments/contribution_b.py --config configs/contribution_b.yaml
 ```
 
-Start in `debug` mode: it exercises every stage on a few hundred images in minutes with no
-GPU, and its numbers are explicitly not reportable. Then `fast`, then `main`.
+Start in `DEBUG` mode: it exercises every stage on a few hundred images in minutes with no
+GPU, and the run prints that its numbers are not reportable. Then `FAST`, then `MAIN`.
+Mode names are matched case-insensitively.
+
+`python -m daowod.cli` (installed as `daowod-run`) does **not** run experiments. Its only
+subcommand is `strategies`, which lists the acquisition registry:
+
+```bash
+daowod-run strategies --verbose
+```
 
 ## 7. Execution modes
 

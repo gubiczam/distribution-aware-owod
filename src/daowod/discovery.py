@@ -1,9 +1,10 @@
 """Discovery, annotation-efficiency, outlier-robustness and diversity metrics.
 
-``daowod.metrics`` decomposes the *detector's* official numbers (known mAP,
-U-Recall, WI, A-OSE) into frequency groups. This module measures something the
-repository has never measured: the quality of the **annotation set itself**, as a
-function of how many regions were annotated.
+The official PROB evaluator owns the *detector's* numbers — known mAP, U-Recall,
+WI, A-OSE — and this repository does not reimplement them. What it measures here
+is a different quantity: the quality of the **annotation set itself**, as a
+function of how many regions were annotated. That is what the proposal's
+annotation-efficiency curve is a curve of.
 
 Discovery counts objects, not proposals
 ---------------------------------------
