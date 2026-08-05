@@ -13,10 +13,15 @@ Two properties are asserted, and they are different:
   clone actually carries it.
 """
 
+import json
+import re
 import subprocess
+import sys
 from pathlib import Path
 
+import nbformat
 import pytest
+from nbformat.validator import validate as validate_nbformat
 
 from daowod.dataset import file_sha256
 
@@ -88,6 +93,48 @@ def test_class_groups_cover_head_medium_and_tail() -> None:
 # --- notebooks ----------------------------------------------------------------
 
 NOTEBOOKS = sorted((REPO_ROOT / "notebooks").glob("*.ipynb"))
+MASTER_NOTEBOOK = REPO_ROOT / "notebooks" / "contribution_a_master_colab.ipynb"
+CONTRIBUTION_B_NOTEBOOK = REPO_ROOT / "notebooks" / "contribution_b_colab.ipynb"
+
+MAX_NOTEBOOK_CELL_CHARS = 12_000
+MAX_NOTEBOOK_LINE_CHARS = 4_000
+LOCAL_PATH_PATTERNS = (
+    r"/Users/[A-Za-z0-9_.-]+",
+    r"/home/(?!runner\b)[A-Za-z0-9_.-]+",
+    r"[A-Z]:\\\\Users",
+    r"/private/(?:tmp|var)/",
+)
+MASTER_FORBIDDEN_IMPLEMENTATIONS = (
+    "def score_pool",
+    "def compute_coherence",
+    "def build_candidate_pool",
+    "def match_proposals",
+    "def allocate(",
+    "KMeans(",
+    "def run_campaign",
+)
+MASTER_REQUIRED_DELEGATION = (
+    "from daowod.pipeline import",
+    "run_pipeline(",
+    '"experiments/contribution_a.py"',
+    '"experiments/component_audit.py"',
+    '"experiments/representation_geometry.py"',
+)
+
+
+def _load_notebook(path: Path) -> dict:
+    notebook = nbformat.read(path, as_version=4)
+    validate_nbformat(notebook)
+    return notebook
+
+
+def _cell_source(cell: dict) -> str:
+    source = cell.get("source", "")
+    return source if isinstance(source, str) else "".join(source)
+
+
+def _code_sources(notebook: dict) -> list[str]:
+    return [_cell_source(cell) for cell in notebook["cells"] if cell["cell_type"] == "code"]
 
 
 def test_the_repository_ships_one_notebook_per_contribution() -> None:
@@ -105,38 +152,60 @@ def test_the_repository_ships_one_notebook_per_contribution() -> None:
 
 
 @pytest.mark.parametrize("path", NOTEBOOKS, ids=lambda path: path.name)
-def test_notebook_is_valid_and_thin(path: Path) -> None:
-    """A notebook must be valid JSON, small, and free of stored outputs.
+def test_notebook_json_is_valid_and_reviewable(path: Path) -> None:
+    """Every notebook is valid, output-free and small enough to review as source."""
 
-    Thin matters: the previous generation embedded its outputs, which made the JSON
-    unreviewable and let a notebook disagree with the library it was supposed to
-    drive. These are shims over experiments/, so they stay short and output-free.
-    """
-
-    import json
-
-    notebook = json.loads(path.read_text(encoding="utf-8"))
-    assert notebook["nbformat"] == 4
-    cells = notebook["cells"]
-    # The master notebook is a research document with a section per stage; the
-    # Contribution B notebook is a shim. Both must stay free of stored outputs, and
-    # neither may reimplement the science - tests/test_master_notebook.py asserts that
-    # directly for the master.
-    limit = 45 if "master" in path.name else 15
-    assert len(cells) <= limit, f"{path.name} has {len(cells)} cells, limit {limit}"
-    for index, cell in enumerate(cells):
+    notebook = _load_notebook(path)
+    for index, cell in enumerate(notebook["cells"]):
+        text = _cell_source(cell)
         assert cell.get("id"), f"{path.name} cell {index} has no id"
         assert cell["cell_type"] in {"markdown", "code"}
+        assert len(text) <= MAX_NOTEBOOK_CELL_CHARS, f"{path.name} cell {index} is huge"
+        assert all(len(line) <= MAX_NOTEBOOK_LINE_CHARS for line in text.splitlines()), (
+            f"{path.name} cell {index} has a giant line"
+        )
+        assert not re.search(r"base64|b'\\x89PNG|data:image/", text), (
+            f"{path.name} cell {index} embeds large data"
+        )
+        for pattern in LOCAL_PATH_PATTERNS:
+            assert not re.search(pattern, text), f"{path.name} cell {index} has a local path"
         if cell["cell_type"] == "code":
             assert not cell.get("outputs"), f"{path.name} cell {index} has stored outputs"
             assert cell.get("execution_count") is None
 
 
+def test_master_notebook_delegates_to_repository_code_and_validator() -> None:
+    """The master notebook is a research notebook, not a parallel implementation."""
+
+    notebook = _load_notebook(MASTER_NOTEBOOK)
+    joined = "\n".join(_code_sources(notebook))
+    for forbidden in MASTER_FORBIDDEN_IMPLEMENTATIONS:
+        assert forbidden not in joined, f"master notebook reimplements {forbidden!r}"
+    for expected in MASTER_REQUIRED_DELEGATION:
+        assert expected in joined, f"master notebook does not use {expected}"
+
+    result = subprocess.run(
+        [sys.executable, "experiments/validate_master_notebook.py"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_contribution_b_notebook_stays_a_thin_shim() -> None:
+    """Contribution B is a compact demo/entrypoint over daowod.memory."""
+
+    notebook = _load_notebook(CONTRIBUTION_B_NOTEBOOK)
+    assert len(notebook["cells"]) <= 15
+    joined = "\n".join(_code_sources(notebook))
+    assert "from daowod.memory import" in joined
+    assert "experiments/contribution_b.py" in joined
+    assert "def allocate" not in joined
+
+
 def test_notebooks_reference_only_paths_that_exist() -> None:
     """Catches a rename that left a notebook pointing at a deleted script."""
-
-    import json
-    import re
 
     for path in NOTEBOOKS:
         text = json.dumps(json.loads(path.read_text(encoding="utf-8")))

@@ -13,6 +13,7 @@ numbers pasted into a cell so a rerun could not contradict them.
 
 from __future__ import annotations
 
+import ast
 import copy
 import json
 import sys
@@ -54,6 +55,31 @@ def code_cells(notebook: dict) -> list[dict]:
     return [cell for cell in notebook["cells"] if cell["cell_type"] == "code"]
 
 
+def source_text(cell: dict) -> str:
+    source = cell.get("source", "")
+    return source if isinstance(source, str) else "".join(source)
+
+
+def parse_configuration_assignments(notebook: dict) -> dict[str, object]:
+    config_cell = next(
+        cell
+        for cell in code_cells(notebook)
+        if "CONFIGURATION" in source_text(cell) and "RUN_MODE" in source_text(cell)
+    )
+    tree = ast.parse(source_text(config_cell))
+    assignments: dict[str, object] = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                try:
+                    assignments[target.id] = ast.literal_eval(node.value)
+                except (TypeError, ValueError):
+                    assignments[target.id] = ast.unparse(node.value)
+    return assignments
+
+
 # --- the real notebook --------------------------------------------------------
 
 
@@ -69,12 +95,10 @@ def test_the_master_notebook_passes_every_validator_check() -> None:
 
 
 def test_every_code_cell_parses(notebook: dict) -> None:
-    import ast
-
     for index, cell in enumerate(notebook["cells"]):
         if cell["cell_type"] != "code":
             continue
-        source = "".join(cell["source"])
+        source = source_text(cell)
         try:
             ast.parse(source)
         except SyntaxError as error:  # pragma: no cover - a failure is the point
@@ -102,7 +126,7 @@ def test_the_notebook_never_claims_official_detector_metrics(notebook: dict) -> 
 def test_the_notebook_does_not_reimplement_the_science(notebook: dict) -> None:
     """It must orchestrate, not re-derive. A second implementation would silently drift."""
 
-    joined = "\n".join("".join(cell["source"]) for cell in code_cells(notebook))
+    joined = "\n".join(source_text(cell) for cell in code_cells(notebook))
     # Signs of a parallel implementation living in the notebook.
     for forbidden in (
         "def score_pool",
@@ -131,29 +155,17 @@ def test_conservative_defaults_are_conservative(notebook: dict) -> None:
     first failed against a correct notebook.
     """
 
-    import ast
-
-    assignments: dict[str, str] = {}
-    for cell in code_cells(notebook):
-        try:
-            tree = ast.parse("".join(cell["source"]))
-        except SyntaxError:
-            continue
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Assign):
-                for target in node.targets:
-                    if isinstance(target, ast.Name):
-                        assignments.setdefault(target.id, ast.unparse(node.value))
+    assignments = parse_configuration_assignments(notebook)
 
     for key, expected in CONSERVATIVE_DEFAULTS.items():
         assert key in assignments, f"{key} is never assigned"
-        assert assignments[key] == expected, (
+        assert assignments[key] is expected, (
             f"{key} defaults to {assignments[key]}, expected {expected}"
         )
 
 
 def test_the_notebook_uses_the_repository_config_for_the_protocol(notebook: dict) -> None:
-    joined = "\n".join("".join(cell["source"]) for cell in code_cells(notebook))
+    joined = "\n".join(source_text(cell) for cell in code_cells(notebook))
     assert "configs/contribution_a.yaml" in joined
     assert "load_modes(" in joined or "resolve_mode(" in joined
 

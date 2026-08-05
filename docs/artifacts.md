@@ -94,6 +94,12 @@ Small, regenerable from the exports above, and cited by `results.md`:
 study state and **no comparison tables**: that run did not finish. See `results.md`
 section 11.
 
+For Colab handoff, use
+[`../notebooks/contribution_a_master_colab.ipynb`](../notebooks/contribution_a_master_colab.ipynb).
+It packages compact CSV/JSON/Markdown/figure outputs and records excluded large caches in
+`archive_manifest.json`; proposal exports and representation arrays remain external
+artifacts under the storage policy below.
+
 ## 4. Storage policy
 
 * `outputs/` is gitignored, and no artifact is copied into the repository. A 466 MB

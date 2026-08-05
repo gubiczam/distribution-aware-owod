@@ -61,8 +61,8 @@ pytest                                        # 215 tests, no GPU, seconds
 
 Start with `--mode DEBUG`: it exercises every stage in minutes with no GPU, and prints
 that its numbers are not reportable. Then `FAST`, then `MAIN`. On Colab use
-[`notebooks/contribution_a_colab.ipynb`](notebooks/contribution_a_colab.ipynb), which is
-a thin shim over the same entrypoint.
+[`notebooks/contribution_a_master_colab.ipynb`](notebooks/contribution_a_master_colab.ipynb),
+the authoritative Contribution A notebook over the same repository entrypoints.
 
 Full protocol, splits, PROB boundary and the exact commands:
 [`docs/reproduction.md`](docs/reproduction.md). Large binaries and their digests:
@@ -106,7 +106,7 @@ src/daowod/            18 modules, flat
   detector.py          the only module that talks to PROB: adapter + export cache
 
 experiments/           one file per experiment; contribution_a.py is the entrypoint
-notebooks/             one thin Colab shim per contribution
+notebooks/             authoritative Contribution A master notebook + Contribution B shim
 tests/                 215 tests, fixtures.py is the only synthetic pool
 ```
 

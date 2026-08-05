@@ -111,6 +111,8 @@ REQUIRED_CONFIG_KEYS: tuple[str, ...] = (
     "CREATE_ZIP",
     "COPY_COMPACT_RESULTS_TO_DRIVE",
     "KEEP_LARGE_INTERMEDIATES",
+    "CLEAN_TEMPORARY_FILES",
+    "RUN_REPRESENTATION_ACQUISITION",
 )
 
 #: Modes the notebook must offer.
@@ -136,12 +138,12 @@ REQUIRED_OUTPUTS: tuple[str, ...] = (
 )
 
 #: Settings whose default must be conservative, and the required default.
-CONSERVATIVE_DEFAULTS: dict[str, str] = {
-    "KEEP_LARGE_INTERMEDIATES": "False",
-    "ENABLE_REPRESENTATION_STUDY": "False",
-    "RUN_REPRESENTATION_ACQUISITION": "False",
-    "CLEAN_TEMPORARY_FILES": "False",
-    "USE_AMP": "False",
+CONSERVATIVE_DEFAULTS: dict[str, bool] = {
+    "KEEP_LARGE_INTERMEDIATES": False,
+    "ENABLE_REPRESENTATION_STUDY": False,
+    "RUN_REPRESENTATION_ACQUISITION": False,
+    "CLEAN_TEMPORARY_FILES": False,
+    "USE_AMP": False,
 }
 
 LOCAL_PATH_PATTERNS = (
@@ -284,7 +286,7 @@ def check_config(notebook: dict, report: Report) -> None:
         return
 
     assigned: set[str] = set()
-    defaults: dict[str, str] = {}
+    defaults: dict[str, object] = {}
     try:
         tree = ast.parse(text)
     except SyntaxError as error:
@@ -295,7 +297,10 @@ def check_config(notebook: dict, report: Report) -> None:
             for target in node.targets:
                 if isinstance(target, ast.Name):
                     assigned.add(target.id)
-                    defaults[target.id] = ast.unparse(node.value)
+                    try:
+                        defaults[target.id] = ast.literal_eval(node.value)
+                    except (TypeError, ValueError):
+                        defaults[target.id] = ast.unparse(node.value)
 
     missing = [key for key in REQUIRED_CONFIG_KEYS if key not in assigned]
     if missing:
@@ -311,10 +316,10 @@ def check_config(notebook: dict, report: Report) -> None:
         report.ok("config", f"all {len(REQUIRED_MODES)} modes documented")
 
     for key, expected in CONSERVATIVE_DEFAULTS.items():
-        if key in defaults and defaults[key] != expected:
+        if key in defaults and defaults[key] is not expected:
             report.fail("config", f"{key} defaults to {defaults[key]}, expected {expected}")
-        elif key not in defaults and key not in all_text:
-            report.warn("config", f"{key} not found anywhere")
+        elif key not in defaults:
+            report.fail("config", f"{key} is not assigned in the configuration cell")
     report.ok("config", "conservative defaults verified")
 
     # The configuration cell must precede any cell that consumes it.

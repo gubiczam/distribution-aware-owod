@@ -186,6 +186,12 @@ python experiments/contribution_a.py representation-acquisition \
     --representations outputs/e4_representations --output outputs/e4_active_learning
 ```
 
+The authoritative Colab handoff for Contribution A is
+[`../notebooks/contribution_a_master_colab.ipynb`](../notebooks/contribution_a_master_colab.ipynb).
+It orchestrates these repository entrypoints, records environment/commit metadata, and
+keeps official detector metrics marked unavailable unless a real retraining/evaluation
+run produces them.
+
 `study` takes only paths: sizes, budgets, rounds, seeds, arms and the severity axis all
 come from the config. Each stage is also runnable directly
 (`python experiments/component_audit.py --help`); the dispatcher forwards its arguments
