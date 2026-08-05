@@ -24,7 +24,15 @@ import pytest
 from daowod import config as config_module
 from daowod import longtail
 from daowod.config import ExecutionMode
-from daowod.pipeline import PipelineConfig, PipelineError, run_pipeline
+from daowod.dataset import read_image_ids
+from daowod.pipeline import (
+    PipelineConfig,
+    PipelineError,
+    run_pipeline,
+    stage_export,
+    stage_pools,
+    stage_splits,
+)
 from daowod.study import PRIMARY_STRATEGIES
 
 IMAGE_WIDTH, IMAGE_HEIGHT = 320, 240
@@ -312,6 +320,127 @@ def test_pilot_choice_is_recorded_and_from_a_disjoint_pool(completed_run) -> Non
     )
     # The main run used the pilot's choice, and says so.
     assert manifest["study_config"]["coherence_method_override"] == pilot["chosen_coherence_method"]
+
+
+def _small_pilot_stage(
+    root: Path,
+    export: Path,
+    split: Path,
+    *,
+    seed: int,
+    research_grade: bool = False,
+):
+    mode = replace(
+        TEST_MODE,
+        name=f"PYTEST_PILOT_{seed}_{int(research_grade)}",
+        evaluation_images=60,
+        pilot_images=5,
+        reference_images=40,
+        research_grade=research_grade,
+    )
+    config = PipelineConfig(
+        mode=mode.name,
+        data_root=str(root),
+        split_file=str(split),
+        existing_export=str(export),
+        output_dir=str(root / f"pilot_{seed}_{int(research_grade)}"),
+        cache_dir=str(root / f"pilot_cache_{seed}_{int(research_grade)}"),
+        require_gpu=False,
+        seed=seed,
+    )
+    config_module.register(mode, replace_existing=True)
+    available = read_image_ids(split)
+    splits = stage_splits(config, mode, available_ids=available)
+    requested = sorted(set(splits["reference"]) | set(splits["pilot"]) | set(splits["evaluation"]))
+    proposals, _ = stage_export(config, image_ids=requested, progress=None)
+    return mode, config, available, splits, proposals
+
+
+def test_zero_tail_pilot_fails_before_the_ablation(
+    fixture_paths: tuple[Path, Path, Path],
+) -> None:
+    root, export, split = fixture_paths
+    mode, config, available, splits, proposals = _small_pilot_stage(
+        root,
+        export,
+        split,
+        seed=0,
+        research_grade=True,
+    )
+
+    with pytest.raises(PipelineError) as error:
+        stage_pools(config, mode, export=proposals, splits=splits, available_ids=available)
+
+    message = str(error.value)
+    assert "zero reachable tail objects" in message
+    assert "pilot image count=5" in message
+    assert "reachable head=" in message
+    assert "reachable medium=" in message
+    assert "reachable tail=0" in message
+    assert "minimum suggested pilot size=" in message
+    assert "pilot ablation was not started" in message
+
+
+def test_zero_tail_debug_pilot_is_deterministically_stratified(
+    fixture_paths: tuple[Path, Path, Path],
+) -> None:
+    root, export, split = fixture_paths
+    mode, config, available, splits, proposals = _small_pilot_stage(
+        root,
+        export,
+        split,
+        seed=0,
+    )
+
+    evaluation, pilot, _, _, updated = stage_pools(
+        config,
+        mode,
+        export=proposals,
+        splits=splits,
+        available_ids=available,
+    )
+
+    assert updated != splits
+    assert updated["evaluation"] == splits["evaluation"]
+    assert len(updated["pilot"]) == mode.pilot_images
+    assert len(updated["reference"]) == mode.reference_images
+    assert not set(updated["pilot"]) & set(updated["reference"])
+    assert not set(updated["pilot"]) & set(updated["evaluation"])
+    assert pilot.targets.object_total("tail") >= 1
+    assert evaluation.targets.object_total("tail") >= 1
+
+    _, second_pilot, _, _, second = stage_pools(
+        config,
+        mode,
+        export=proposals,
+        splits=splits,
+        available_ids=available,
+    )
+    assert second == updated
+    assert second_pilot.targets.object_total("tail") == pilot.targets.object_total("tail")
+
+
+def test_valid_pilot_split_is_left_unchanged(
+    fixture_paths: tuple[Path, Path, Path],
+) -> None:
+    root, export, split = fixture_paths
+    mode, config, available, splits, proposals = _small_pilot_stage(
+        root,
+        export,
+        split,
+        seed=1,
+    )
+
+    _, pilot, _, _, updated = stage_pools(
+        config,
+        mode,
+        export=proposals,
+        splits=splits,
+        available_ids=available,
+    )
+
+    assert updated == splits
+    assert pilot.targets.object_total("tail") >= 1
 
 
 def test_runtime_plan_is_recorded_with_a_verdict(completed_run) -> None:

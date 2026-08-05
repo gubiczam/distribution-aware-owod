@@ -571,6 +571,100 @@ def stage_splits(
     return detector.split_disjoint(available_ids, counts=counts, seed=config.seed)
 
 
+def _split_order(image_ids: Sequence[str], *, seed: int) -> list[str]:
+    """The deterministic image order used by :func:`detector.split_disjoint`."""
+
+    unique = sorted(dict.fromkeys(str(value) for value in image_ids))
+    generator = np.random.default_rng(seed)
+    return [unique[int(position)] for position in generator.permutation(len(unique))]
+
+
+def _reachable_object_counts(prepared: PreparedPool) -> dict[str, int]:
+    return {group: prepared.targets.object_total(group) for group in ("head", "medium", "tail")}
+
+
+def _reachable_images(prepared: PreparedPool, *, group: str) -> set[str]:
+    """Images containing at least one reachable object in ``group``."""
+
+    images: set[str] = set()
+    selected = prepared.table.gt_is_unknown & (prepared.table.gt_group == group)
+    for object_index in prepared.table.gt_object_index[selected].tolist():
+        index = int(object_index)
+        if index >= 0:
+            images.add(str(prepared.table.objects[index].image_id))
+    return images
+
+
+def _minimum_pilot_size_for_tail(
+    *,
+    mode: ExecutionMode,
+    available_ids: Sequence[str],
+    seed: int,
+    tail_images: Iterable[str],
+) -> int:
+    """Smallest pilot size that would catch a tail image in the current order.
+
+    This is advice only. The protocol is not enlarged automatically.
+    """
+
+    tail = {str(value) for value in tail_images}
+    if not tail:
+        return int(mode.pilot_images) + 1
+    order = _split_order(available_ids, seed=seed)
+    after_reference = order[int(mode.reference_images) :]
+    for index, image_id in enumerate(after_reference, start=1):
+        if image_id in tail:
+            return max(index, int(mode.pilot_images) + 1)
+    return int(mode.pilot_images) + 1
+
+
+def _zero_tail_pilot_error(
+    *,
+    pilot: PreparedPool,
+    mode: ExecutionMode,
+    minimum_suggested_pilot_size: int,
+    detail: str,
+) -> PipelineError:
+    counts = _reachable_object_counts(pilot)
+    return PipelineError(
+        "Pilot split has zero reachable tail objects, so hyperparameter selection "
+        "cannot produce a finite tail_discovery_auc. The expensive pilot ablation "
+        "was not started. "
+        f"pilot image count={mode.pilot_images}; "
+        f"reachable head={counts['head']}; "
+        f"reachable medium={counts['medium']}; "
+        f"reachable tail={counts['tail']}; "
+        f"minimum suggested pilot size={minimum_suggested_pilot_size}. "
+        f"{detail}"
+    )
+
+
+def _swap_reference_tail_into_pilot(
+    *,
+    splits: Mapping[str, Sequence[str]],
+    reference: PreparedPool,
+) -> dict[str, list[str]] | None:
+    """Deterministically move one reachable-tail reserve image into the pilot.
+
+    Evaluation is left untouched. The displaced pilot image moves to the reference
+    reserve, so counts and disjointness stay fixed.
+    """
+
+    reference_tail = sorted(_reachable_images(reference, group="tail"))
+    if not reference_tail:
+        return None
+    donor = reference_tail[0]
+    replacement = sorted(str(value) for value in splits["pilot"])[0]
+    updated = {name: sorted(str(value) for value in values) for name, values in splits.items()}
+    updated["reference"] = sorted(
+        replacement if image_id == donor else image_id for image_id in updated["reference"]
+    )
+    updated["pilot"] = sorted(
+        donor if image_id == replacement else image_id for image_id in updated["pilot"]
+    )
+    return updated
+
+
 def _available_ids(config: PipelineConfig) -> list[str]:
     if config.split_file:
         return read_image_ids(config.split_file)
@@ -667,7 +761,14 @@ def stage_pools(
     *,
     export: Mapping[str, NDArray[np.generic]],
     splits: Mapping[str, Sequence[str]],
-) -> tuple[PreparedPool, PreparedPool | None, NDArray[np.float64], ClassGroups]:
+    available_ids: Sequence[str],
+) -> tuple[
+    PreparedPool,
+    PreparedPool | None,
+    NDArray[np.float64],
+    ClassGroups,
+    dict[str, list[str]],
+]:
     """Evaluation pool, pilot pool, reference bank — sharing one class grouping.
 
     The grouping is derived from the *evaluation* pool's reachable class
@@ -684,16 +785,74 @@ def stage_pools(
         config=config_study,
         restrict_to_images=list(splits["evaluation"]),
     )
+    updated_splits = {
+        name: sorted(str(value) for value in values) for name, values in splits.items()
+    }
     pilot = None
     if mode.run_pilot and splits.get("pilot"):
         pilot = study.prepare_pool(
             export=export,
             annotations_dir=str(config.annotations_dir),
             config=config_study,
-            restrict_to_images=list(splits["pilot"]),
+            restrict_to_images=list(updated_splits["pilot"]),
             class_groups=evaluation.class_groups,
         )
-    reference_ids = {str(value) for value in splits["reference"]}
+        if pilot.targets.object_total("tail") == 0:
+            reference_probe = study.prepare_pool(
+                export=export,
+                annotations_dir=str(config.annotations_dir),
+                config=config_study,
+                restrict_to_images=list(updated_splits["reference"]),
+                class_groups=evaluation.class_groups,
+            )
+            tail_images = (
+                _reachable_images(reference_probe, group="tail")
+                | _reachable_images(evaluation, group="tail")
+                | _reachable_images(pilot, group="tail")
+            )
+            minimum = _minimum_pilot_size_for_tail(
+                mode=mode,
+                available_ids=available_ids,
+                seed=config.seed,
+                tail_images=tail_images,
+            )
+            if mode.research_grade:
+                raise _zero_tail_pilot_error(
+                    pilot=pilot,
+                    mode=mode,
+                    minimum_suggested_pilot_size=minimum,
+                    detail="Reportable modes keep the declared protocol unchanged; "
+                    "choose a protocol whose declared pilot reaches the tail.",
+                )
+            repaired = _swap_reference_tail_into_pilot(
+                splits=updated_splits,
+                reference=reference_probe,
+            )
+            if repaired is None:
+                raise _zero_tail_pilot_error(
+                    pilot=pilot,
+                    mode=mode,
+                    minimum_suggested_pilot_size=minimum,
+                    detail="No reachable tail object is available in the reference "
+                    "reserve for deterministic stratification.",
+                )
+            updated_splits = repaired
+            pilot = study.prepare_pool(
+                export=export,
+                annotations_dir=str(config.annotations_dir),
+                config=config_study,
+                restrict_to_images=list(updated_splits["pilot"]),
+                class_groups=evaluation.class_groups,
+            )
+            if pilot.targets.object_total("tail") == 0:
+                raise _zero_tail_pilot_error(
+                    pilot=pilot,
+                    mode=mode,
+                    minimum_suggested_pilot_size=minimum,
+                    detail="Deterministic pilot stratification did not recover a "
+                    "reachable tail denominator.",
+                )
+    reference_ids = {str(value) for value in updated_splits["reference"]}
     ids = np.asarray([str(value) for value in export["image_ids"].tolist()], dtype=object)
     keep = np.array([str(value) in reference_ids for value in ids.tolist()], dtype=np.bool_)
     if not keep.any():
@@ -705,7 +864,7 @@ def stage_pools(
         {"embeddings": np.asarray(export["embeddings"])[keep]},
         limit=mode.reference_limit,
     )
-    return evaluation, pilot, bank, evaluation.class_groups
+    return evaluation, pilot, bank, evaluation.class_groups, updated_splits
 
 
 def stage_severities(
@@ -968,7 +1127,6 @@ def run_pipeline(
             f"export disk ~{export_only.export_disk_bytes / 1e9:.2f} GB",
         )
         export_only.enforce()
-    state.save(f"splits_{config.fingerprint()}", dict(splits))
     result.stage_seconds["probe"] = round(time.time() - stage_started, 1)
 
     _log(progress, "[4/11] Proposal export (cached, resumable)")
@@ -984,7 +1142,14 @@ def run_pipeline(
 
     _log(progress, "[5/11] Candidate pool and region oracle")
     stage_started = time.time()
-    evaluation, pilot, bank, groups = stage_pools(config, mode, export=export, splits=splits)
+    evaluation, pilot, bank, groups, splits = stage_pools(
+        config,
+        mode,
+        export=export,
+        splits=splits,
+        available_ids=available,
+    )
+    state.save(f"splits_{config.fingerprint()}", dict(splits))
     result.pool_report = dict(evaluation.pool_report)
     result.composition = dict(evaluation.composition)
     _log(
