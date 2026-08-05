@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from daowod.dataset import DatasetState, build_long_tail_pool, file_sha256
-from daowod.prob_adapter import ProposalBatch
+from daowod.detector import ProposalBatch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 STAGE1B_CANDIDATE_SPLIT = Path("data/protocol/stage1b/stage1b_candidate_500.txt")

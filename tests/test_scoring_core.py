@@ -9,7 +9,7 @@ pilot numbers reproducible after the refactor.
 import numpy as np
 import pytest
 
-from daowod.normalisation import average_ranks, normalise
+from daowod.components import average_ranks, normalise
 from daowod.scoring import (
     REQUIRED_STRATEGIES,
     STRATEGY_REGISTRY,

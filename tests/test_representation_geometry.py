@@ -18,7 +18,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from daowod import geometry, representation_plots, representations
+from daowod import figures, geometry, representations
 from daowod.audit import Strata
 
 DIMENSIONS = 16
@@ -312,7 +312,7 @@ def test_substituted_export_round_trips_through_disk(tmp_path) -> None:
 def test_the_candidate_pool_is_identical_after_substitution(tmp_path) -> None:
     """The claim Phase 5 rests on, checked rather than assumed."""
 
-    from daowod import annotation_study, candidates
+    from daowod import candidates, study
 
     export = make_export(count=240)
     spec = candidates.CandidatePoolSpec(per_image_limit=5)
@@ -337,7 +337,7 @@ def test_the_candidate_pool_is_identical_after_substitution(tmp_path) -> None:
         spec=spec,
     )
     assert original.indices.tolist() == after.indices.tolist()
-    assert annotation_study.STRATEGY_FAMILY["full"] == "baseline"  # baseline untouched
+    assert study.STRATEGY_FAMILY["full"] == "baseline"  # baseline untouched
 
 
 # --------------------------------------------------------------------------
@@ -347,7 +347,7 @@ def test_the_candidate_pool_is_identical_after_substitution(tmp_path) -> None:
 
 def test_balanced_sampling_keeps_every_unknown_region() -> None:
     _, strata = clustered_space(tail_clusters=True, count=300)
-    indices = representation_plots.sample_indices(strata, scheme="balanced", seed=0)
+    indices = figures.sample_indices(strata, scheme="balanced", seed=0)
     assert strata.is_unknown[indices].sum() == int(strata.is_unknown.sum())
     # ...and it is not simply everything.
     assert indices.size < strata.is_unknown.shape[0]
@@ -355,7 +355,7 @@ def test_balanced_sampling_keeps_every_unknown_region() -> None:
 
 def test_natural_sampling_preserves_the_composition() -> None:
     _, strata = clustered_space(tail_clusters=True, count=600)
-    indices = representation_plots.sample_indices(strata, scheme="natural", size=300, seed=0)
+    indices = figures.sample_indices(strata, scheme="natural", size=300, seed=0)
     assert indices.size == 300
     observed = float(strata.is_unknown[indices].mean())
     expected = float(strata.is_unknown.mean())
@@ -364,8 +364,8 @@ def test_natural_sampling_preserves_the_composition() -> None:
 
 def test_projection_is_deterministic_and_two_dimensional() -> None:
     embeddings, _ = clustered_space(tail_clusters=True, count=200)
-    first, manifest = representation_plots.project(embeddings, method="pca", seed=0)
-    second, _ = representation_plots.project(embeddings, method="pca", seed=0)
+    first, manifest = figures.project(embeddings, method="pca", seed=0)
+    second, _ = figures.project(embeddings, method="pca", seed=0)
     assert first.shape == (200, 2)
     assert np.allclose(first, second)
     assert manifest["method"] == "pca"
@@ -375,11 +375,11 @@ def test_figures_are_written(tmp_path) -> None:
     embeddings, strata = clustered_space(tail_clusters=True, count=240)
     structure = geometry.Neighbourhoods.build(embeddings, neighbours=5)
     purity = [geometry.purity_summary(structure, strata, representation="synthetic")]
-    written = representation_plots.purity_bars(geometry.headline_table(purity), tmp_path)
+    written = figures.purity_bars(geometry.headline_table(purity), tmp_path)
     assert {path.suffix for path in written} == {".png", ".pdf"}
-    written = representation_plots.purity_panel(purity, tmp_path)
+    written = figures.purity_panel(purity, tmp_path)
     assert written
-    paths, manifest = representation_plots.projection_figure(
+    paths, manifest = figures.projection_figure(
         embeddings,
         strata,
         tmp_path,
@@ -478,23 +478,23 @@ def test_sibling_rank_reports_excluded_singletons() -> None:
 
 
 def test_paired_interval_widens_with_spread_and_narrows_with_seeds() -> None:
-    from daowod import reporting
+    from daowod import tables
 
-    tight = reporting.paired_interval([0.10, 0.11, 0.09])
-    loose = reporting.paired_interval([0.10, 0.30, -0.10])
+    tight = tables.paired_interval([0.10, 0.11, 0.09])
+    loose = tables.paired_interval([0.10, 0.30, -0.10])
     assert tight[0] > 0.0 and tight[1] > tight[0]  # excludes zero: an effect
     assert loose[0] < 0.0 < loose[1]  # includes zero: not an effect
     assert (loose[1] - loose[0]) > (tight[1] - tight[0])
 
 
 def test_paired_interval_is_undefined_for_a_single_seed() -> None:
-    from daowod import reporting
+    from daowod import tables
 
-    low, high = reporting.paired_interval([0.2])
+    low, high = tables.paired_interval([0.2])
     assert np.isnan(low) and np.isnan(high)
 
 
 def test_paired_interval_ignores_non_finite_entries() -> None:
-    from daowod import reporting
+    from daowod import tables
 
-    assert reporting.paired_interval([0.1, 0.2, np.nan]) == reporting.paired_interval([0.1, 0.2])
+    assert tables.paired_interval([0.1, 0.2, np.nan]) == tables.paired_interval([0.1, 0.2])

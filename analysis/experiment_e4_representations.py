@@ -28,16 +28,15 @@ from pathlib import Path
 
 import numpy as np
 
-from daowod import annotation_study as study
 from daowod import (
     audit,
     candidates,
     components,
-    export_cache,
+    detector,
     geometry,
-    reporting,
-    representation_plots,
     representations,
+    study,
+    tables,
 )
 from daowod.modes import resolve_mode
 
@@ -74,7 +73,7 @@ def main() -> None:
     export = study.load_export(args.export)
     image_ids = np.asarray([str(value) for value in export["image_ids"].tolist()], dtype=object)
     available_images = sorted(set(image_ids.tolist()))
-    splits = export_cache.split_disjoint(
+    splits = detector.split_disjoint(
         available_images,
         counts={
             "reference": mode.reference_images,
@@ -108,7 +107,7 @@ def main() -> None:
 
     # --- representation audit (Phase 1 as a table) -----------------------------
     audit_rows = representations.audit_rows(export=export, directory=directory)
-    reporting.write_csv(output / "representation_audit.csv", audit_rows)
+    tables.write_csv(output / "representation_audit.csv", audit_rows)
     ready = [row["name"] for row in audit_rows if row["available"]]
     if args.only:
         wanted = set(args.only)
@@ -123,7 +122,7 @@ def main() -> None:
             )
 
     coverage = _coverage(directory, ready, pool_rows)
-    reporting.write_csv(output / "representation_coverage.csv", coverage)
+    tables.write_csv(output / "representation_coverage.csv", coverage)
     for row in coverage:
         if not row["fully_covered"]:
             raise RuntimeError(
@@ -175,27 +174,25 @@ def main() -> None:
             flush=True,
         )
 
-    reporting.write_csv(output / "neighbourhood_purity.csv", purity)
-    reporting.write_csv(output / "local_density.csv", density)
-    reporting.write_csv(output / "nearest_neighbour_precision.csv", precision)
-    reporting.write_csv(output / "mutual_neighbour_consistency.csv", mutual)
-    reporting.write_csv(output / "cluster_quality.csv", clusters)
-    reporting.write_csv(output / "compactness_separation.csv", compactness)
-    reporting.write_csv(output / "background_tail_overlap.csv", overlap)
-    reporting.write_csv(output / "component_distributions.csv", component_rows)
-    reporting.write_csv(output / "same_class_sibling_rank.csv", sibling)
-    reporting.write_csv(output / "pseudo_class_alignment.csv", pseudo)
+    tables.write_csv(output / "neighbourhood_purity.csv", purity)
+    tables.write_csv(output / "local_density.csv", density)
+    tables.write_csv(output / "nearest_neighbour_precision.csv", precision)
+    tables.write_csv(output / "mutual_neighbour_consistency.csv", mutual)
+    tables.write_csv(output / "cluster_quality.csv", clusters)
+    tables.write_csv(output / "compactness_separation.csv", compactness)
+    tables.write_csv(output / "background_tail_overlap.csv", overlap)
+    tables.write_csv(output / "component_distributions.csv", component_rows)
+    tables.write_csv(output / "same_class_sibling_rank.csv", sibling)
+    tables.write_csv(output / "pseudo_class_alignment.csv", pseudo)
     headline = geometry.headline_table(purity)
-    reporting.write_csv(output / "headline_tail_purity.csv", headline)
+    tables.write_csv(output / "headline_tail_purity.csv", headline)
 
     # --- Phase 4: figures -----------------------------------------------------
     figures: list[str] = []
-    figures += [str(path) for path in representation_plots.purity_bars(headline, output)]
-    figures += [str(path) for path in representation_plots.purity_panel(purity, output)]
-    figures += [
-        str(path) for path in representation_plots.geometry_scatter(clusters, compactness, output)
-    ]
-    figures += [str(path) for path in representation_plots.density_figure(density, output)]
+    figures += [str(path) for path in figures.purity_bars(headline, output)]
+    figures += [str(path) for path in figures.purity_panel(purity, output)]
+    figures += [str(path) for path in figures.geometry_scatter(clusters, compactness, output)]
+    figures += [str(path) for path in figures.density_figure(density, output)]
 
     projection_manifests: list[dict[str, object]] = []
     if not args.skip_projections:
@@ -214,7 +211,7 @@ def main() -> None:
             extra = {"coherence": coherence, "objectness": objectness}
             for method in ("pca", "tsne"):
                 for scheme in ("balanced", "natural"):
-                    written, manifest = representation_plots.projection_figure(
+                    written, manifest = figures.projection_figure(
                         matrix,
                         strata,
                         output,
@@ -231,7 +228,7 @@ def main() -> None:
     # --- Phase 6 inputs: the comparison against the baseline space -------------
     baseline = representations.BASELINE_REPRESENTATION
     deltas = _deltas(purity, clusters, compactness, overlap, baseline=baseline)
-    reporting.write_csv(output / "geometry_vs_baseline.csv", deltas)
+    tables.write_csv(output / "geometry_vs_baseline.csv", deltas)
 
     manifest = {
         "export": args.export,
@@ -250,11 +247,11 @@ def main() -> None:
             for row in audit_rows
             if not row["available"]
         ],
-        "projection_note": representation_plots.unused_grid_note(),
+        "projection_note": figures.unused_grid_note(),
         "projections": projection_manifests,
         "figures": figures,
     }
-    reporting.write_json(output / "e4_geometry_manifest.json", manifest)
+    tables.write_json(output / "e4_geometry_manifest.json", manifest)
     (output / "e4_geometry_summary.md").write_text(
         _summary(
             manifest, headline, purity, clusters, compactness, overlap, deltas, pseudo, sibling

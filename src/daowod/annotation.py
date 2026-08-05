@@ -47,8 +47,7 @@ from typing import Literal
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
-from daowod.normalisation import normalise
-from daowod.revealed import RevealedBank, anchored_rarity, support
+from daowod.components import RevealedBank, anchored_rarity, normalise, support
 from daowod.scoring import ScoringResult, StrategySpec, score_pool
 
 FloatArray = NDArray[np.float64]
@@ -136,7 +135,7 @@ class AcquisitionState:
     """Embeddings of annotated regions, split by oracle verdict.
 
     Filled only by :func:`reveal`, and only at annotated positions. This is what
-    the label-anchored estimators in :mod:`daowod.revealed` read; they never see a
+    the label-anchored estimators in :mod:`daowod.components` read; they never see a
     ground-truth array themselves.
     """
 

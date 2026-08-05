@@ -33,8 +33,7 @@ from pathlib import Path
 
 import numpy as np
 
-from daowod import annotation_study as study
-from daowod import modes, reporting, representations
+from daowod import modes, representations, study, tables
 from daowod.modes import resolve_mode
 from daowod.pipeline import PipelineConfig, run_pipeline
 
@@ -151,7 +150,7 @@ def main() -> None:
             entry = dict(row)
             entry["representation"] = name
             auc_rows.append(entry)
-        for row in reporting.discovery_counts(result.outputs.strategy_rows):
+        for row in tables.discovery_counts(result.outputs.strategy_rows):
             entry = dict(row)
             entry["representation"] = name
             counts_rows.append(entry)
@@ -168,20 +167,18 @@ def main() -> None:
         )
         print(f"  done in {(time.time() - started) / 60:.1f} min", flush=True)
 
-    reporting.write_csv(output / "e4_budget_curves.csv", curve_rows)
-    reporting.write_csv(output / "e4_strategy_auc.csv", auc_rows)
-    reporting.write_csv(output / "e4_discovery_counts.csv", counts_rows)
+    tables.write_csv(output / "e4_budget_curves.csv", curve_rows)
+    tables.write_csv(output / "e4_strategy_auc.csv", auc_rows)
+    tables.write_csv(output / "e4_discovery_counts.csv", counts_rows)
 
     invariance = _invariance_check(counts_rows)
-    reporting.write_csv(output / "e4_invariance_check.csv", invariance)
+    tables.write_csv(output / "e4_invariance_check.csv", invariance)
     comparison = _representation_comparison(auc_rows, counts_rows)
-    reporting.write_csv(output / "e4_representation_comparison.csv", comparison)
+    tables.write_csv(output / "e4_representation_comparison.csv", comparison)
 
-    from daowod import representation_plots
+    from daowod import figures
 
-    figures = [
-        str(path) for path in representation_plots.active_learning_comparison(counts_rows, output)
-    ]
+    figures = [str(path) for path in figures.active_learning_comparison(counts_rows, output)]
 
     manifest = {
         "export": args.export,
@@ -194,7 +191,7 @@ def main() -> None:
         "invariance_violations": [row for row in invariance if not row["consistent"]],
         "figures": figures,
     }
-    reporting.write_json(output / "e4_active_learning_manifest.json", manifest)
+    tables.write_json(output / "e4_active_learning_manifest.json", manifest)
     (output / "e4_active_learning_summary.md").write_text(
         _summary(manifest, comparison, invariance), encoding="utf-8"
     )
@@ -287,7 +284,7 @@ def _representation_comparison(auc_rows, counts_rows) -> list[dict[str, object]]
                 # Paired-difference confidence interval from the t distribution. With
                 # three seeds this is wide, and it is reported precisely so that a
                 # difference smaller than the interval is not read as an effect.
-                interval = reporting.paired_interval(differences)
+                interval = tables.paired_interval(differences)
                 rows.append(
                     {
                         "representation": representation,

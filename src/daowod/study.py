@@ -24,9 +24,9 @@ from numpy.typing import ArrayLike, NDArray
 
 from daowod import candidates as candidate_module
 from daowod import discovery, longtail, oracle
-from daowod.active import CampaignResult, ProposalPool, initial_state, run_campaign, score_round
-from daowod.groups import ClassGroups
+from daowod.annotation import CampaignResult, ProposalPool, initial_state, run_campaign, score_round
 from daowod.longtail import ImbalanceSpec
+from daowod.oracle import ClassGroups
 from daowod.scoring import STRATEGY_REGISTRY, StrategySpec
 
 FloatArray = NDArray[np.float64]
@@ -46,7 +46,7 @@ PRIMARY_STRATEGIES: tuple[str, ...] = (
 
 #: The label-anchored variants, which differ from the baseline in exactly one
 #: respect: where the distribution-aware term's rarity and coherence come from.
-#: See :mod:`daowod.revealed` for the measurements that motivate them.
+#: See :mod:`daowod.components` for the measurements that motivate them.
 ANCHORED_STRATEGIES: tuple[str, ...] = (
     "revealed_support_only",
     "revealed_no_gate",
@@ -548,7 +548,7 @@ def _selection_rows(
 ) -> list[dict[str, object]]:
     """Selected regions with their oracle verdict attached post hoc."""
 
-    from daowod.active import selection_frame_rows
+    from daowod.annotation import selection_frame_rows
 
     rows = selection_frame_rows(result, pool=scoped.pool, budgets=budgets)
     for row in rows:
@@ -799,7 +799,7 @@ def leakage_check(
     1. :func:`daowod.discovery.assert_selection_is_ground_truth_free` rebuilds the
        score from the recorded components; an unrecorded oracle term would break
        the identity;
-    2. :func:`daowod.active.score_round` takes no ground-truth parameter at all,
+    2. :func:`daowod.annotation.score_round` takes no ground-truth parameter at all,
        checked by introspection rather than by trust, so the *only* way ground
        truth could enter is through the pool arrays;
     3. the pool arrays handed to the scorer carry no ``gt_`` field, checked by the

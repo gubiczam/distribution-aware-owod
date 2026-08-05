@@ -3,7 +3,7 @@
 This is Representation Experiment E4's feature extractor. It must run **outside**
 the DAOWOD environment: `daowod` deliberately does not depend on torch, and the
 only interpreter on this machine that has torch is the PROB checkout's virtual
-environment. The boundary is therefore the same one `daowod.prob_adapter` uses for
+environment. The boundary is therefore the same one `daowod.detector` uses for
 the detector — a subprocess that writes an NPZ the library then reads:
 
     ~/Documents/PROB/.venv/bin/python analysis/extract_region_embeddings.py \\

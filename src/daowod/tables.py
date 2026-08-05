@@ -25,7 +25,7 @@ from pathlib import Path
 import numpy as np
 from numpy.typing import ArrayLike
 
-from daowod.annotation_study import STRATEGY_ROLES, StudyOutputs
+from daowod.study import STRATEGY_ROLES, StudyOutputs
 
 #: The strategy the headline comparison is read against, and the two rungs below
 #: it that isolate what each added term contributes.

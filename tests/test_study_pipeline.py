@@ -22,9 +22,9 @@ import numpy as np
 import pytest
 
 from daowod import longtail, modes
-from daowod.annotation_study import PRIMARY_STRATEGIES
 from daowod.modes import ExecutionMode
 from daowod.pipeline import PipelineConfig, PipelineError, run_pipeline
+from daowod.study import PRIMARY_STRATEGIES
 
 IMAGE_WIDTH, IMAGE_HEIGHT = 320, 240
 DIMENSIONS = 12

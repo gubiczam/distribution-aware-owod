@@ -21,20 +21,20 @@ import numpy as np
 import pytest
 
 from daowod import (
-    active,
-    annotation_study,
+    annotation,
     candidates,
+    detector,
     discovery,
-    export_cache,
+    figures,
     longtail,
     modes,
     oracle,
     pipeline,
-    plots,
-    reporting,
+    study,
+    tables,
 )
 from daowod.components import compute_novelty
-from daowod.groups import ClassGroups
+from daowod.oracle import ClassGroups
 
 # --------------------------------------------------------------------------
 # A tiny synthetic export with known geometry. Deliberately not the simulator:
@@ -367,10 +367,10 @@ def test_budgets_are_clamped_to_the_pool() -> None:
 # --------------------------------------------------------------------------
 
 
-def make_pool(count: int = 40, dimensions: int = 8) -> active.ProposalPool:
+def make_pool(count: int = 40, dimensions: int = 8) -> annotation.ProposalPool:
     generator = np.random.default_rng(3)
     posterior = generator.random((count, 5)) + 0.01
-    return active.ProposalPool(
+    return annotation.ProposalPool(
         proposal_ids=np.array([f"p{index:03d}" for index in range(count)], dtype=object),
         image_ids=np.array([f"img{index % 5}" for index in range(count)], dtype=object),
         embeddings=generator.normal(size=(count, dimensions)),
@@ -384,11 +384,11 @@ def make_pool(count: int = 40, dimensions: int = 8) -> active.ProposalPool:
 
 def test_annotated_proposals_can_never_be_selected_twice() -> None:
     pool = make_pool()
-    spec = annotation_study.STRATEGY_REGISTRY.resolve("full")
-    state = active.initial_state(pool_size=pool.size, reference_embeddings=pool.embeddings[:5])
-    first = active.score_round(pool=pool, spec=spec, state=state, seed=0)
-    chosen = active.select_batch(first.scores, batch_size=5, proposal_ids=pool.proposal_ids)
-    state = active.reveal(
+    spec = study.STRATEGY_REGISTRY.resolve("full")
+    state = annotation.initial_state(pool_size=pool.size, reference_embeddings=pool.embeddings[:5])
+    first = annotation.score_round(pool=pool, spec=spec, state=state, seed=0)
+    chosen = annotation.select_batch(first.scores, batch_size=5, proposal_ids=pool.proposal_ids)
+    state = annotation.reveal(
         state,
         selected=chosen,
         pool=pool,
@@ -396,9 +396,9 @@ def test_annotated_proposals_can_never_be_selected_twice() -> None:
         gt_class=np.array([""] * pool.size, dtype=object),
         gt_is_unknown=np.zeros(pool.size, dtype=bool),
     )
-    second = active.score_round(pool=pool, spec=spec, state=state, seed=0)
+    second = annotation.score_round(pool=pool, spec=spec, state=state, seed=0)
     assert np.isneginf(second.scores[chosen]).all()
-    again = active.select_batch(second.scores, batch_size=5, proposal_ids=pool.proposal_ids)
+    again = annotation.select_batch(second.scores, batch_size=5, proposal_ids=pool.proposal_ids)
     assert not set(again.tolist()) & set(chosen.tolist())
 
 
@@ -414,8 +414,10 @@ def test_reveal_reads_the_oracle_only_at_selected_positions() -> None:
     unknown = np.ones(pool.size, dtype=bool)
 
     def run(classes: np.ndarray) -> tuple[set[str], dict[int, int]]:
-        state = active.initial_state(pool_size=pool.size, reference_embeddings=pool.embeddings[:4])
-        state = active.reveal(
+        state = annotation.initial_state(
+            pool_size=pool.size, reference_embeddings=pool.embeddings[:4]
+        )
+        state = annotation.reveal(
             state,
             selected=selected,
             pool=pool,
@@ -432,8 +434,8 @@ def test_every_round_verifies_its_own_score_against_its_components(monkeypatch) 
     """The leakage identity is checked per round, not once per run."""
 
     pool = make_pool()
-    spec = annotation_study.STRATEGY_REGISTRY.resolve("full")
-    state = active.initial_state(pool_size=pool.size, reference_embeddings=pool.embeddings[:5])
+    spec = study.STRATEGY_REGISTRY.resolve("full")
+    state = annotation.initial_state(pool_size=pool.size, reference_embeddings=pool.embeddings[:5])
 
     calls: list[int] = []
     real = discovery.assert_selection_is_ground_truth_free
@@ -443,7 +445,7 @@ def test_every_round_verifies_its_own_score_against_its_components(monkeypatch) 
         real(**kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(discovery, "assert_selection_is_ground_truth_free", counting)
-    active.score_round(pool=pool, spec=spec, state=state, seed=0)
+    annotation.score_round(pool=pool, spec=spec, state=state, seed=0)
     assert calls == [1]
 
     def failing(**_: object) -> None:
@@ -451,20 +453,20 @@ def test_every_round_verifies_its_own_score_against_its_components(monkeypatch) 
 
     monkeypatch.setattr(discovery, "assert_selection_is_ground_truth_free", failing)
     with pytest.raises(discovery.MetricError):
-        active.score_round(pool=pool, spec=spec, state=state, seed=0)
+        annotation.score_round(pool=pool, spec=spec, state=state, seed=0)
 
 
 def test_selection_is_deterministic_and_breaks_ties_by_proposal_id() -> None:
     scores = np.array([1.0, 1.0, 1.0, 0.5])
     ids = np.array(["pB", "pA", "pC", "pD"], dtype=object)
-    chosen = active.select_batch(scores, batch_size=2, proposal_ids=ids)
+    chosen = annotation.select_batch(scores, batch_size=2, proposal_ids=ids)
     assert sorted(ids[chosen].tolist()) == ["pA", "pB"]
 
 
 def test_campaign_order_is_a_prefix_chain() -> None:
     pool = make_pool()
-    spec = annotation_study.STRATEGY_REGISTRY.resolve("full")
-    result = active.run_campaign(
+    spec = study.STRATEGY_REGISTRY.resolve("full")
+    result = annotation.run_campaign(
         pool=pool,
         spec=spec,
         reference_embeddings=pool.embeddings[:5],
@@ -480,7 +482,7 @@ def test_campaign_order_is_a_prefix_chain() -> None:
 
 
 def test_saturation_downweights_already_bought_clusters() -> None:
-    state = active.AcquisitionState(
+    state = annotation.AcquisitionState(
         annotated=np.zeros(4, dtype=bool),
         reference_embeddings=np.zeros((1, 3)),
         annotations_per_cluster={0: 3},
@@ -558,7 +560,7 @@ def test_aggregation_reports_nan_sd_for_a_single_seed() -> None:
 
 
 # --------------------------------------------------------------------------
-# Modes, runtime planning, reporting
+# Modes, runtime planning, tables
 # --------------------------------------------------------------------------
 
 
@@ -575,7 +577,7 @@ def test_every_mode_is_internally_consistent() -> None:
 
 def test_main_mode_targets_the_five_required_strategies() -> None:
     mode = modes.resolve_mode("MAIN")
-    assert mode.strategies == annotation_study.PRIMARY_STRATEGIES
+    assert mode.strategies == study.PRIMARY_STRATEGIES
     assert len(mode.strategies) == 5
     assert mode.research_grade is True
 
@@ -646,7 +648,7 @@ def test_cell_cost_scales_superlinearly_in_pool_size() -> None:
 
 
 def test_split_disjoint_partitions_without_overlap() -> None:
-    pools = export_cache.split_disjoint(
+    pools = detector.split_disjoint(
         [f"img{index}" for index in range(30)],
         counts={"reference": 10, "pilot": 5, "evaluation": 12},
         seed=1,
@@ -654,7 +656,7 @@ def test_split_disjoint_partitions_without_overlap() -> None:
     assert [len(pools[name]) for name in ("reference", "pilot", "evaluation")] == [10, 5, 12]
     assert not set(pools["pilot"]) & set(pools["evaluation"])
     assert not set(pools["reference"]) & set(pools["evaluation"])
-    assert pools == export_cache.split_disjoint(
+    assert pools == detector.split_disjoint(
         [f"img{index}" for index in reversed(range(30))],
         counts={"reference": 10, "pilot": 5, "evaluation": 12},
         seed=1,
@@ -662,12 +664,12 @@ def test_split_disjoint_partitions_without_overlap() -> None:
 
 
 def test_split_disjoint_refuses_to_overdraw() -> None:
-    with pytest.raises(export_cache.ExportError, match="lists only"):
-        export_cache.split_disjoint(["a", "b"], counts={"reference": 2, "evaluation": 2}, seed=0)
+    with pytest.raises(detector.ExportError, match="lists only"):
+        detector.split_disjoint(["a", "b"], counts={"reference": 2, "evaluation": 2}, seed=0)
 
 
 def test_export_fingerprint_changes_with_the_protocol_not_the_interpreter() -> None:
-    base = export_cache.BridgeSettings(
+    base = detector.BridgeSettings(
         prob_repository="/prob", checkpoint="/ckpt.pth", data_root="/data"
     )
     same = replace(base, python_executable="/other/python", num_workers=8)
@@ -678,7 +680,7 @@ def test_export_fingerprint_changes_with_the_protocol_not_the_interpreter() -> N
 
 
 def test_predict_command_carries_every_protocol_flag() -> None:
-    command = export_cache.BridgeSettings(
+    command = detector.BridgeSettings(
         prob_repository="/prob", checkpoint="/ckpt.pth", data_root="/data"
     ).predict_command()
     for fragment in (
@@ -695,7 +697,7 @@ def test_predict_command_carries_every_protocol_flag() -> None:
 
 
 def test_chunking_is_deterministic_and_deduplicated() -> None:
-    chunks = export_cache.chunk_image_ids(["b", "a", "b", "c", "d"], chunk_images=2)
+    chunks = detector.chunk_image_ids(["b", "a", "b", "c", "d"], chunk_images=2)
     assert chunks == [["a", "b"], ["c", "d"]]
 
 
@@ -706,7 +708,7 @@ def test_paired_contrasts_are_computed_per_seed() -> None:
         {"strategy": "full", "seed": 1, "imbalance_setting": "n", "tail_discovery_auc": 0.6},
         {"strategy": "random", "seed": 1, "imbalance_setting": "n", "tail_discovery_auc": 0.1},
     ]
-    contrasts = reporting.headline_contrasts(auc_rows)
+    contrasts = tables.headline_contrasts(auc_rows)
     row = next(item for item in contrasts if item["comparison"] == "gate vs random")
     assert row["paired_seeds"] == 2
     assert row["mean_difference"] == pytest.approx(0.4)
@@ -724,10 +726,10 @@ def test_cost_to_reach_reports_a_miss_as_a_miss() -> None:
         }
         for budget, recall in ((10, 0.1), (20, 0.2))
     ]
-    result = reporting.budget_to_reach(rows, target_recall=0.5)
+    result = tables.budget_to_reach(rows, target_recall=0.5)
     assert result[0]["reached"] is False
     assert result[0]["budget_to_reach"] is None
-    reached = reporting.budget_to_reach(rows, target_recall=0.15)
+    reached = tables.budget_to_reach(rows, target_recall=0.15)
     assert reached[0]["budget_to_reach"] == 20
 
 
@@ -744,7 +746,7 @@ def test_summary_states_a_negative_verdict_when_the_gate_loses() -> None:
             "all_seeds_negative": True,
         }
     ]
-    text = reporting.research_summary(
+    text = tables.research_summary(
         mode={"name": "FAST", "description": "d", "research_grade": False},
         pool_report={},
         composition={},
@@ -765,7 +767,7 @@ def test_bundle_excludes_the_proposal_cache(tmp_path: Path) -> None:
     (tmp_path / "table.csv").write_text("a,b\n1,2\n", encoding="utf-8")
     (tmp_path / "figure.png").write_bytes(b"\x89PNG\r\n")
     (tmp_path / "chunk_0000.npz").write_bytes(b"not a real npz")
-    archive = reporting.bundle(tmp_path, archive=tmp_path / "out.zip")
+    archive = tables.bundle(tmp_path, archive=tmp_path / "out.zip")
     import zipfile
 
     with zipfile.ZipFile(archive) as handle:
@@ -777,7 +779,7 @@ def test_bundle_excludes_the_proposal_cache(tmp_path: Path) -> None:
 def test_expected_files_are_verified_not_assumed(tmp_path: Path) -> None:
     (tmp_path / "present.csv").write_text("x\n", encoding="utf-8")
     (tmp_path / "empty.csv").write_text("", encoding="utf-8")
-    rows = reporting.verify_expected_files(tmp_path, ["present.csv", "empty.csv", "absent.csv"])
+    rows = tables.verify_expected_files(tmp_path, ["present.csv", "empty.csv", "absent.csv"])
     statuses = {row["artifact"]: row["status"] for row in rows}
     assert statuses == {"present.csv": "PASS", "empty.csv": "FAIL", "absent.csv": "FAIL"}
 
@@ -785,9 +787,9 @@ def test_expected_files_are_verified_not_assumed(tmp_path: Path) -> None:
 def test_strategy_colours_are_keyed_by_entity_not_position() -> None:
     """Filtering the strategy set must not repaint the survivors."""
 
-    for strategy in annotation_study.PRIMARY_STRATEGIES:
-        assert strategy in plots.STRATEGY_COLOURS
-    assert len(set(plots.STRATEGY_COLOURS.values())) == len(plots.STRATEGY_COLOURS)
+    for strategy in study.PRIMARY_STRATEGIES:
+        assert strategy in figures.STRATEGY_COLOURS
+    assert len(set(figures.STRATEGY_COLOURS.values())) == len(figures.STRATEGY_COLOURS)
 
 
 def test_dataset_staging_copies_only_what_is_needed_and_resumes(tmp_path: Path) -> None:
@@ -801,7 +803,7 @@ def test_dataset_staging_copies_only_what_is_needed_and_resumes(tmp_path: Path) 
     (source / "ImageSets" / "OWDETR" / "split.txt").write_text("img0\nimg1\n", encoding="utf-8")
 
     destination = tmp_path / "local"
-    report = export_cache.stage_dataset(
+    report = detector.stage_dataset(
         source=source, destination=destination, image_ids=["img0", "img1"], dataset="OWDETR"
     )
     assert report["images"] == 2
@@ -810,7 +812,7 @@ def test_dataset_staging_copies_only_what_is_needed_and_resumes(tmp_path: Path) 
     assert not (destination / "JPEGImages" / "img2.jpg").exists()
     assert report["splits"] == ["split.txt"]
 
-    again = export_cache.stage_dataset(
+    again = detector.stage_dataset(
         source=source, destination=destination, image_ids=["img0", "img1"], dataset="OWDETR"
     )
     assert again["files_copied"] == 0
@@ -822,8 +824,8 @@ def test_dataset_staging_names_the_missing_file(tmp_path: Path) -> None:
     (source / "Annotations").mkdir(parents=True)
     (source / "JPEGImages").mkdir(parents=True)
     (source / "Annotations" / "img0.xml").write_text("<annotation/>", encoding="utf-8")
-    with pytest.raises(export_cache.ExportError, match="missing at the source"):
-        export_cache.stage_dataset(
+    with pytest.raises(detector.ExportError, match="missing at the source"):
+        detector.stage_dataset(
             source=source, destination=tmp_path / "local", image_ids=["img0"], dataset="OWDETR"
         )
 
@@ -841,7 +843,7 @@ def _coherence_rows(tail: float, background: float) -> list[dict[str, object]]:
 
 
 def _summary_with(rows: list[dict[str, object]]) -> str:
-    return reporting.research_summary(
+    return tables.research_summary(
         mode={"name": "MAIN", "description": "d", "research_grade": True},
         pool_report={},
         composition={},
@@ -861,7 +863,7 @@ def test_coherence_separation_diagnoses_a_coherent_background() -> None:
     """A negative contrast must come with the reason, not just the number."""
 
     rows = _coherence_rows(tail=0.44, background=0.56)
-    report = reporting.coherence_separation(rows)
+    report = tables.coherence_separation(rows)
     assert report["available"] is True
     assert report["separates_tail_from_isolated_outliers"] is True
     assert report["separates_tail_from_background"] is False
@@ -873,7 +875,7 @@ def test_a_one_percent_coherence_difference_is_not_a_separation() -> None:
     """The measured case: tail 0.559 versus background 0.553 is noise, not signal."""
 
     rows = _coherence_rows(tail=0.559, background=0.553)
-    report = reporting.coherence_separation(rows)
+    report = tables.coherence_separation(rows)
     assert report["separates_tail_from_background"] is False
     assert report["tail_indistinguishable_from_background"] is True
     text = _summary_with(rows)
@@ -882,11 +884,11 @@ def test_a_one_percent_coherence_difference_is_not_a_separation() -> None:
 
 def test_a_real_separation_is_reported_as_one() -> None:
     rows = _coherence_rows(tail=0.80, background=0.40)
-    report = reporting.coherence_separation(rows)
+    report = tables.coherence_separation(rows)
     assert report["separates_tail_from_background"] is True
     assert report["tail_indistinguishable_from_background"] is False
     assert "more coherent than background" in _summary_with(rows)
 
 
 def test_coherence_separation_is_absent_when_nothing_was_recorded() -> None:
-    assert reporting.coherence_separation([]) == {"available": False}
+    assert tables.coherence_separation([]) == {"available": False}

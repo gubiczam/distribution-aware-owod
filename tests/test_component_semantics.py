@@ -158,7 +158,7 @@ def test_every_cluster_size_regime_produces_finite_defined_values(
 def test_rarity_is_continuous_not_a_singleton_indicator() -> None:
     """S4: under rank normalisation rarity must grade, not flag."""
 
-    from daowod.normalisation import normalise
+    from daowod.components import normalise
 
     counts = (120, 60, 30, 12, 6, 3, 1)
     embeddings, labels, _ = structured_regime_pool(proposals_per_class=counts, seed=4)
@@ -176,7 +176,7 @@ def test_rarity_is_continuous_not_a_singleton_indicator() -> None:
 
 
 def test_all_rarity_methods_agree_under_rank_normalisation() -> None:
-    from daowod.normalisation import normalise
+    from daowod.components import normalise
 
     _, labels, _ = structured_regime_pool(proposals_per_class=(50, 20, 8, 2), seed=5)
     ranked = [

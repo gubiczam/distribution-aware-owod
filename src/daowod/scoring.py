@@ -28,7 +28,7 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 from daowod import components
-from daowod.normalisation import NORMALISATION_METHODS, normalise
+from daowod.components import NORMALISATION_METHODS, normalise
 
 FloatArray = NDArray[np.float64]
 IntArray = NDArray[np.int64]
@@ -381,7 +381,7 @@ _SPECS: tuple[StrategySpec, ...] = (
     # already confirmed, rather than k-means over a pool that is 75 % background.
     # Motivated by the measured 0.35 ROC-AUC gap between what the decoder features
     # support (supervised probe 0.837) and what the unsupervised estimators extract
-    # (0.44-0.49); see daowod.revealed.
+    # (0.44-0.49); see daowod.components.
     StrategySpec(
         name="revealed_full",
         uncertainty_weight=ALPHA,

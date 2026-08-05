@@ -44,9 +44,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 
 from daowod import longtail
-from daowod.annotation_study import COMPARISON_STRATEGIES, PRIMARY_STRATEGIES, StudyConfig
 from daowod.candidates import CandidatePoolSpec
 from daowod.longtail import ImbalanceSpec
+from daowod.study import COMPARISON_STRATEGIES, PRIMARY_STRATEGIES, StudyConfig
 
 #: The three modes the notebook offers. :func:`register` can add more — a name is
 #: a label, and the registry is the only thing that decides what ``resolve_mode``
@@ -105,7 +105,7 @@ class ExecutionMode:
         return self.evaluation_images + self.pilot_images + self.reference_images
 
     def study_config(self) -> StudyConfig:
-        """The :class:`~daowod.annotation_study.StudyConfig` this mode implies."""
+        """The :class:`~daowod.study.StudyConfig` this mode implies."""
 
         return StudyConfig(
             budgets=tuple(self.budgets),

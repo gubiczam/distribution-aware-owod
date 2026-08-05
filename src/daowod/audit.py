@@ -26,7 +26,7 @@ That is a statement about neighbourhood label composition, and it is directly
 checkable.
 
 Everything here reads ground truth. Nothing here may be imported by the
-acquisition path; :mod:`daowod.discovery` and :mod:`daowod.active` enforce that
+acquisition path; :mod:`daowod.discovery` and :mod:`daowod.annotation` enforce that
 separation, and the leakage guard re-derives every score from its recorded
 components regardless.
 """
@@ -405,7 +405,7 @@ def pseudo_class_quality(
 
 
 def _spearman(left: ArrayLike, right: ArrayLike) -> float:
-    from daowod.normalisation import average_ranks
+    from daowod.components import average_ranks
 
     a = average_ranks(left)
     b = average_ranks(right)
@@ -490,7 +490,7 @@ def revealed_sample_complexity(
     signal fitted on a region cannot be credited with ranking that same region.
 
     Two estimators: mean similarity to the revealed unknowns (what
-    :func:`daowod.revealed.support` computes) and a linear probe on the revealed
+    :func:`daowod.components.support` computes) and a linear probe on the revealed
     labels. The curve is the evidence for whether anchoring is viable at realistic
     budgets, and it is measured before any campaign is run.
     """

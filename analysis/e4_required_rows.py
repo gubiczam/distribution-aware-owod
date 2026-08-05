@@ -22,8 +22,7 @@ from pathlib import Path
 
 import numpy as np
 
-from daowod import annotation_study as study
-from daowod import candidates, export_cache
+from daowod import candidates, detector, study
 from daowod.modes import resolve_mode
 
 
@@ -61,7 +60,7 @@ def main() -> None:
     export = study.load_export(args.export)
     image_ids = np.asarray([str(value) for value in export["image_ids"].tolist()], dtype=object)
     available = sorted(set(image_ids.tolist()))
-    splits = export_cache.split_disjoint(
+    splits = detector.split_disjoint(
         available,
         counts={
             "reference": mode.reference_images,

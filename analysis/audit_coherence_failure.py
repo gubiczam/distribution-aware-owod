@@ -23,9 +23,8 @@ from pathlib import Path
 
 import numpy as np
 
-from daowod import annotation_study as study
-from daowod import audit, candidates, components, export_cache, reporting
-from daowod.normalisation import normalise
+from daowod import audit, candidates, components, detector, study, tables
+from daowod.components import normalise
 
 
 def parse_args() -> argparse.Namespace:
@@ -51,7 +50,7 @@ def main() -> None:
 
     export = study.load_export(args.export)
     available = sorted({str(value) for value in export["image_ids"].tolist()})
-    splits = export_cache.split_disjoint(
+    splits = detector.split_disjoint(
         available,
         counts={
             "reference": args.reference_images,
@@ -137,20 +136,20 @@ def main() -> None:
     auc_rows = audit.signal_auc(signals, strata)
     print("measuring supervised probe ceilings...", flush=True)
     auc_rows += audit.probe_auc(feature_sets, strata, seed=args.seed)
-    reporting.write_csv(output / "signal_auc.csv", auc_rows)
+    tables.write_csv(output / "signal_auc.csv", auc_rows)
 
     gaps = [
         audit.summarise_gap(auc_rows, target=target)
         for target in ("unknown_vs_background", "tail_vs_background", "onobject_vs_background")
     ]
-    reporting.write_csv(output / "representation_vs_estimator_gap.csv", gaps)
+    tables.write_csv(output / "representation_vs_estimator_gap.csv", gaps)
 
     print("measuring precision at the actual annotation budgets...", flush=True)
     precision = audit.precision_at_budget(signals, strata, budgets=(100, 500, 2000))
     precision += audit.precision_at_budget(
         signals, strata, budgets=(100, 500, 2000), positive="tail"
     )
-    reporting.write_csv(output / "precision_at_budget.csv", precision)
+    tables.write_csv(output / "precision_at_budget.csv", precision)
 
     print("measuring neighbourhood composition...", flush=True)
     neighbourhood = audit.neighbourhood_composition(
@@ -168,11 +167,11 @@ def main() -> None:
             subset=keep,
             label=f"top {int(fraction * 100)}% by objectness x sqrt(area)",
         )
-    reporting.write_csv(output / "neighbourhood_composition.csv", neighbourhood)
+    tables.write_csv(output / "neighbourhood_composition.csv", neighbourhood)
 
     print("measuring pseudo-class quality...", flush=True)
     quality = audit.pseudo_class_quality(pseudo_labels, rarity, strata)
-    reporting.write_json(output / "pseudo_class_quality.json", quality)
+    tables.write_json(output / "pseudo_class_quality.json", quality)
 
     print("measuring pool-filter retention...", flush=True)
     retention: list[dict[str, object]] = []
@@ -183,7 +182,7 @@ def main() -> None:
         ("objectness_x_sqrt_area", conditioning),
     ):
         retention += audit.retention_curve(ranking, strata, table.gt_object_index, name=name)
-    reporting.write_csv(output / "pool_filter_retention.csv", retention)
+    tables.write_csv(output / "pool_filter_retention.csv", retention)
 
     print("measuring free-heuristic reference discovery...", flush=True)
     budgets = (100, 250, 500, 1000, 2000)
@@ -197,13 +196,13 @@ def main() -> None:
         reference += audit.static_ranking_discovery(
             ranking, strata, table.gt_object_index, budgets=budgets, name=name
         )
-    reporting.write_csv(output / "static_ranking_discovery.csv", reference)
+    tables.write_csv(output / "static_ranking_discovery.csv", reference)
 
     print("measuring revealed-label sample complexity...", flush=True)
     complexity = audit.revealed_sample_complexity(
         embeddings, strata, draws=args.draws, seed=args.seed
     )
-    reporting.write_csv(output / "revealed_sample_complexity.csv", complexity)
+    tables.write_csv(output / "revealed_sample_complexity.csv", complexity)
 
     manifest = {
         "export": args.export,
@@ -225,7 +224,7 @@ def main() -> None:
         "gaps": gaps,
         "pseudo_class_quality": quality,
     }
-    reporting.write_json(output / "audit_manifest.json", manifest)
+    tables.write_json(output / "audit_manifest.json", manifest)
     (output / "audit_summary.md").write_text(
         _summary(manifest, auc_rows, neighbourhood, complexity, reference, precision),
         encoding="utf-8",

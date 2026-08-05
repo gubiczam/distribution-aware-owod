@@ -18,13 +18,13 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from daowod import active, revealed
+from daowod import annotation, components
 from daowod.scoring import STRATEGY_REGISTRY, StrategyError, StrategySpec
 
 DIMENSIONS = 8
 
 
-def make_pool(count: int = 60) -> active.ProposalPool:
+def make_pool(count: int = 60) -> annotation.ProposalPool:
     """Two tight semantic groups plus diffuse background, in a known geometry."""
 
     generator = np.random.default_rng(0)
@@ -38,7 +38,7 @@ def make_pool(count: int = 60) -> active.ProposalPool:
     embeddings = np.vstack([group_a, group_b, diffuse])
     posterior = generator.random((embeddings.shape[0], 5)) + 0.01
     size = embeddings.shape[0]
-    return active.ProposalPool(
+    return annotation.ProposalPool(
         proposal_ids=np.array([f"p{index:03d}" for index in range(size)], dtype=object),
         image_ids=np.array([f"img{index % 6}" for index in range(size)], dtype=object),
         embeddings=embeddings,
@@ -56,7 +56,7 @@ def make_pool(count: int = 60) -> active.ProposalPool:
 
 
 def test_bank_splits_by_verdict_and_counts_classes() -> None:
-    bank = revealed.RevealedBank()
+    bank = components.RevealedBank()
     bank.add(np.ones(4), is_unknown=True, class_name="kite")
     bank.add(np.ones(4) * 2, is_unknown=True, class_name="kite")
     bank.add(np.ones(4) * 3, is_unknown=True, class_name="vase")
@@ -73,20 +73,20 @@ def test_bank_splits_by_verdict_and_counts_classes() -> None:
 
 
 def test_support_is_neutral_before_anything_is_revealed() -> None:
-    values, report = revealed.support(
-        np.random.default_rng(0).normal(size=(10, 4)), revealed.RevealedBank()
+    values, report = components.support(
+        np.random.default_rng(0).normal(size=(10, 4)), components.RevealedBank()
     )
     assert report["cold_start"] is True
-    assert values.tolist() == [revealed.COLD_START_SUPPORT] * 10
+    assert values.tolist() == [components.COLD_START_SUPPORT] * 10
 
 
 def test_support_defers_to_the_unsupervised_value_when_a_fallback_is_given() -> None:
     """What the acquisition loop does, so a cold round matches the baseline."""
 
     unsupervised = np.linspace(0.1, 0.9, 10)
-    values, report = revealed.support(
+    values, report = components.support(
         np.random.default_rng(0).normal(size=(10, 4)),
-        revealed.RevealedBank(),
+        components.RevealedBank(),
         fallback=unsupervised,
     )
     assert report["cold_start"] is True
@@ -96,11 +96,11 @@ def test_support_defers_to_the_unsupervised_value_when_a_fallback_is_given() -> 
 
 def test_support_ranks_regions_resembling_confirmed_unknowns_highest() -> None:
     pool = make_pool()
-    bank = revealed.RevealedBank()
+    bank = components.RevealedBank()
     # The oracle confirmed two members of group A (indices 0 and 1).
     bank.add(pool.embeddings[0], is_unknown=True, class_name="kite")
     bank.add(pool.embeddings[1], is_unknown=True, class_name="kite")
-    values, report = revealed.support(pool.embeddings, bank, neighbours=2)
+    values, report = components.support(pool.embeddings, bank, neighbours=2)
     assert report["cold_start"] is False
     third = pool.size // 3
     assert values[:third].mean() > values[third : 2 * third].mean()
@@ -112,25 +112,25 @@ def test_support_uses_the_nearest_anchors_not_the_whole_bank() -> None:
     """A second confirmed class must not dilute support for the first."""
 
     pool = make_pool()
-    bank_one = revealed.RevealedBank()
+    bank_one = components.RevealedBank()
     bank_one.add(pool.embeddings[0], is_unknown=True, class_name="kite")
-    bank_both = revealed.RevealedBank()
+    bank_both = components.RevealedBank()
     bank_both.add(pool.embeddings[0], is_unknown=True, class_name="kite")
     for offset in range(pool.size // 3, pool.size // 3 + 6):
         bank_both.add(pool.embeddings[offset], is_unknown=True, class_name="vase")
     near_a = slice(0, pool.size // 3)
-    only, _ = revealed.support(pool.embeddings, bank_one, neighbours=1)
-    both, _ = revealed.support(pool.embeddings, bank_both, neighbours=1)
+    only, _ = components.support(pool.embeddings, bank_one, neighbours=1)
+    both, _ = components.support(pool.embeddings, bank_both, neighbours=1)
     assert both[near_a].mean() == pytest.approx(only[near_a].mean(), abs=1e-9)
 
 
 def test_support_blocking_does_not_change_the_result() -> None:
     pool = make_pool(count=300)
-    bank = revealed.RevealedBank()
+    bank = components.RevealedBank()
     for index in range(12):
         bank.add(pool.embeddings[index], is_unknown=True, class_name=f"c{index % 3}")
-    whole, _ = revealed.support(pool.embeddings, bank, neighbours=3)
-    assert np.allclose(whole, revealed.support(pool.embeddings, bank, neighbours=3)[0])
+    whole, _ = components.support(pool.embeddings, bank, neighbours=3)
+    assert np.allclose(whole, components.support(pool.embeddings, bank, neighbours=3)[0])
 
 
 # --------------------------------------------------------------------------
@@ -141,13 +141,13 @@ def test_support_blocking_does_not_change_the_result() -> None:
 def test_anchored_rarity_falls_back_until_two_classes_are_revealed() -> None:
     pool = make_pool()
     fallback = np.arange(pool.size, dtype=np.float64)
-    bank = revealed.RevealedBank()
-    values, report = revealed.anchored_rarity(pool.embeddings, bank, fallback=fallback)
+    bank = components.RevealedBank()
+    values, report = components.anchored_rarity(pool.embeddings, bank, fallback=fallback)
     assert report["cold_start"] is True
     assert values.tolist() == fallback.tolist()
 
     bank.add(pool.embeddings[0], is_unknown=True, class_name="kite")
-    values, report = revealed.anchored_rarity(pool.embeddings, bank, fallback=fallback)
+    values, report = components.anchored_rarity(pool.embeddings, bank, fallback=fallback)
     assert report["cold_start"] is True  # one class is not a distribution
     assert values.tolist() == fallback.tolist()
 
@@ -155,12 +155,12 @@ def test_anchored_rarity_falls_back_until_two_classes_are_revealed() -> None:
 def test_anchored_rarity_prefers_the_class_revealed_least_often() -> None:
     pool = make_pool()
     third = pool.size // 3
-    bank = revealed.RevealedBank()
+    bank = components.RevealedBank()
     # "common" confirmed four times in group A, "rare" once in group B.
     for index in range(4):
         bank.add(pool.embeddings[index], is_unknown=True, class_name="common")
     bank.add(pool.embeddings[third], is_unknown=True, class_name="rare")
-    values, report = revealed.anchored_rarity(pool.embeddings, bank, fallback=np.zeros(pool.size))
+    values, report = components.anchored_rarity(pool.embeddings, bank, fallback=np.zeros(pool.size))
     assert report["cold_start"] is False
     assert report["source"] == "nearest revealed class"
     # Group B resembles the rare class and must score higher than group A.
@@ -173,9 +173,9 @@ def test_anchored_rarity_prefers_the_class_revealed_least_often() -> None:
 
 
 def _run(
-    spec: StrategySpec, pool: active.ProposalPool, *, gt_class, gt_unknown, rounds=3, budget=18
+    spec: StrategySpec, pool: annotation.ProposalPool, *, gt_class, gt_unknown, rounds=3, budget=18
 ):
-    return active.run_campaign(
+    return annotation.run_campaign(
         pool=pool,
         spec=spec,
         reference_embeddings=pool.embeddings[:4],
@@ -187,7 +187,7 @@ def _run(
     )
 
 
-def _truth(pool: active.ProposalPool):
+def _truth(pool: annotation.ProposalPool):
     """Group A is class 'kite', group B is class 'vase', the rest is background."""
 
     third = pool.size // 3
@@ -205,10 +205,14 @@ def test_cold_first_round_is_identical_to_the_unsupervised_baseline() -> None:
     pool = make_pool()
     baseline = STRATEGY_REGISTRY.resolve("full")
     anchored = STRATEGY_REGISTRY.resolve("revealed_full")
-    state_b = active.initial_state(pool_size=pool.size, reference_embeddings=pool.embeddings[:4])
-    state_a = active.initial_state(pool_size=pool.size, reference_embeddings=pool.embeddings[:4])
-    first_b = active.score_round(pool=pool, spec=baseline, state=state_b, seed=0)
-    first_a = active.score_round(pool=pool, spec=anchored, state=state_a, seed=0)
+    state_b = annotation.initial_state(
+        pool_size=pool.size, reference_embeddings=pool.embeddings[:4]
+    )
+    state_a = annotation.initial_state(
+        pool_size=pool.size, reference_embeddings=pool.embeddings[:4]
+    )
+    first_b = annotation.score_round(pool=pool, spec=baseline, state=state_b, seed=0)
+    first_a = annotation.score_round(pool=pool, spec=anchored, state=state_a, seed=0)
     assert first_a.anchored["support"]["cold_start"] is True
     assert first_a.anchored["rarity"]["cold_start"] is True
     assert np.allclose(first_a.scores, first_b.scores)
@@ -227,8 +231,8 @@ def test_the_bank_grows_only_with_annotated_regions() -> None:
     )
     assert result.selection_order.size == 18
     # Reconstructing the bank from the trajectory must reproduce its size exactly.
-    state = active.initial_state(pool_size=pool.size, reference_embeddings=pool.embeddings[:4])
-    state = active.reveal(
+    state = annotation.initial_state(pool_size=pool.size, reference_embeddings=pool.embeddings[:4])
+    state = annotation.reveal(
         state,
         selected=result.selection_order,
         pool=pool,
@@ -279,10 +283,10 @@ def test_anchored_round_records_its_bank_state() -> None:
     pool = make_pool()
     classes, unknown = _truth(pool)
     spec = STRATEGY_REGISTRY.resolve("revealed_full")
-    state = active.initial_state(pool_size=pool.size, reference_embeddings=pool.embeddings[:4])
-    first = active.score_round(pool=pool, spec=spec, state=state, seed=0)
-    selected = active.select_batch(first.scores, batch_size=12, proposal_ids=pool.proposal_ids)
-    state = active.reveal(
+    state = annotation.initial_state(pool_size=pool.size, reference_embeddings=pool.embeddings[:4])
+    first = annotation.score_round(pool=pool, spec=spec, state=state, seed=0)
+    selected = annotation.select_batch(first.scores, batch_size=12, proposal_ids=pool.proposal_ids)
+    state = annotation.reveal(
         state,
         selected=selected,
         pool=pool,
@@ -290,9 +294,9 @@ def test_anchored_round_records_its_bank_state() -> None:
         gt_class=classes,
         gt_is_unknown=unknown,
     )
-    second = active.score_round(pool=pool, spec=spec, state=state, seed=0)
+    second = annotation.score_round(pool=pool, spec=spec, state=state, seed=0)
     assert second.anchored["support"]["revealed_unknown_regions"] == state.bank.unknown_count
-    report = revealed.diagnostics(state.bank, support_values=np.linspace(0, 1, 5))
+    report = components.diagnostics(state.bank, support_values=np.linspace(0, 1, 5))
     assert report["support_mean"] == pytest.approx(0.5)
 
 
@@ -362,16 +366,14 @@ def test_prior_strategies_are_scored_end_to_end() -> None:
 
 
 def test_the_comparison_matrix_holds_baseline_control_and_new_arms() -> None:
-    from daowod import annotation_study
+    from daowod import study
 
-    families = {
-        annotation_study.STRATEGY_FAMILY[name] for name in annotation_study.COMPARISON_STRATEGIES
-    }
+    families = {study.STRATEGY_FAMILY[name] for name in study.COMPARISON_STRATEGIES}
     assert "baseline" in families
     assert "free-control" in families
     assert "label-anchored" in families
-    assert "full" in annotation_study.COMPARISON_STRATEGIES  # the baseline is retained
-    assert len(annotation_study.COMPARISON_STRATEGIES) == 11
+    assert "full" in study.COMPARISON_STRATEGIES  # the baseline is retained
+    assert len(study.COMPARISON_STRATEGIES) == 11
 
 
 def test_per_round_anchored_diagnostics_are_recorded() -> None:

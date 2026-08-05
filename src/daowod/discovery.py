@@ -31,9 +31,8 @@ from dataclasses import dataclass
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
-from daowod.active import CampaignResult, ProposalPool
-from daowod.groups import GROUP_NAMES
-from daowod.oracle import OracleTable
+from daowod.annotation import CampaignResult, ProposalPool
+from daowod.oracle import GROUP_NAMES, OracleTable
 
 FloatArray = NDArray[np.float64]
 IntArray = NDArray[np.int64]
