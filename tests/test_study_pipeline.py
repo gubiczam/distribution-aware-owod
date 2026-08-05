@@ -22,7 +22,7 @@ import numpy as np
 import pytest
 
 from daowod import config as config_module
-from daowod import longtail
+from daowod import longtail, study
 from daowod.config import ExecutionMode
 from daowod.dataset import read_image_ids
 from daowod.pipeline import (
@@ -172,6 +172,129 @@ def build_fixture(root: Path, *, images: int = 120, seed: int = 0) -> tuple[Path
         objectness=np.asarray(rows_objectness, dtype=np.float64),
     )
     return export_path, splits_dir / "test_split.txt"
+
+
+def build_pilot_grouping_edge_fixture(root: Path) -> tuple[Path, Path]:
+    """Fixture where DEBUG must not force evaluation-only groups onto the pilot."""
+
+    annotations_dir = root / "Annotations"
+    images_dir = root / "JPEGImages"
+    splits_dir = root / "ImageSets" / "OWDETR"
+    for directory in (annotations_dir, images_dir, splits_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    ids = [f"img{index}" for index in range(20)]
+    classes_by_image = {image_id: [] for image_id in ids}
+    evaluation_ids = {"img0", "img13", "img15", "img16", "img18", "img19", "img2", "img8"}
+    pilot_ids = {"img11", "img3", "img6"}
+    reference_ids = {"img10", "img12", "img14", "img9"}
+
+    evaluation_classes = [
+        "bench",
+        "bench",
+        "bench",
+        "bench",
+        "bench",
+        "bench",
+        "bench",
+        "bench",
+        "bottle",
+        "bottle",
+        "bottle",
+        "bottle",
+        "bowl",
+        "bowl",
+        "bowl",
+        "oven",
+        "scissors",
+        "umbrella",
+    ]
+    for index, class_name in enumerate(evaluation_classes):
+        image_id = sorted(evaluation_ids)[index % len(evaluation_ids)]
+        classes_by_image[image_id].append(class_name)
+    pilot_classes = ("cake", "cake", "cake", "keyboard", "keyboard", "sofa")
+    for index, class_name in enumerate(pilot_classes):
+        image_id = sorted(pilot_ids)[index % len(pilot_ids)]
+        classes_by_image[image_id].append(class_name)
+    for image_id in sorted(reference_ids):
+        classes_by_image[image_id].append("bench")
+
+    class_order = sorted({name for names in classes_by_image.values() for name in names})
+    centres = {
+        name: np.eye(len(class_order), DIMENSIONS, dtype=np.float64)[index]
+        for index, name in enumerate(class_order)
+    }
+
+    rows_image: list[str] = []
+    rows_embedding: list[np.ndarray] = []
+    rows_box: list[list[float]] = []
+    rows_objectness: list[float] = []
+    rows_confidence: list[float] = []
+    rows_posterior: list[np.ndarray] = []
+    rows_label: list[int] = []
+
+    for image_id in ids:
+        objects = classes_by_image[image_id]
+        body = ""
+        for object_index, class_name in enumerate(objects):
+            x_min = 10 + object_index * 18
+            y_min = 10 + object_index * 12
+            x_max = x_min + 12
+            y_max = y_min + 12
+            body += (
+                f"<object><name>{class_name}</name><bndbox>"
+                f"<xmin>{x_min}</xmin><ymin>{y_min}</ymin>"
+                f"<xmax>{x_max}</xmax><ymax>{y_max}</ymax>"
+                "</bndbox></object>"
+            )
+            rows_image.append(image_id)
+            rows_box.append(
+                [
+                    ((x_min - 1 + x_max) / 2.0) / IMAGE_WIDTH,
+                    ((y_min - 1 + y_max) / 2.0) / IMAGE_HEIGHT,
+                    (x_max - (x_min - 1)) / IMAGE_WIDTH,
+                    (y_max - (y_min - 1)) / IMAGE_HEIGHT,
+                ]
+            )
+            rows_embedding.append(centres[class_name])
+            rows_objectness.append(0.95)
+            rows_confidence.append(0.9)
+            rows_label.append(80)
+            rows_posterior.append(np.asarray([0.02, 0.02, 0.02, 0.02, 0.02, 0.9]))
+        body += (
+            "<object><name>dog</name><bndbox>"
+            "<xmin>250</xmin><ymin>180</ymin><xmax>290</xmax><ymax>220</ymax>"
+            "</bndbox></object>"
+        )
+        (annotations_dir / f"{image_id}.xml").write_text(
+            "<annotation><size>"
+            f"<width>{IMAGE_WIDTH}</width><height>{IMAGE_HEIGHT}</height><depth>3</depth>"
+            f"</size>{body}</annotation>",
+            encoding="utf-8",
+        )
+        (images_dir / f"{image_id}.jpg").write_bytes(b"\xff\xd8\xff\xd9")
+        for offset in range(2):
+            rows_image.append(image_id)
+            rows_box.append([0.8, 0.2 + offset * 0.1, 0.05, 0.05])
+            rows_embedding.append(np.full(DIMENSIONS, -1.0 - offset))
+            rows_objectness.append(0.05)
+            rows_confidence.append(0.05)
+            rows_label.append(80)
+            rows_posterior.append(np.full(6, 1 / 6))
+
+    (splits_dir / "debug_edge.txt").write_text("\n".join(ids) + "\n", encoding="utf-8")
+    export_path = root / "debug_edge.npz"
+    np.savez_compressed(
+        export_path,
+        image_ids=np.asarray(rows_image, dtype=object),
+        confidence=np.asarray(rows_confidence, dtype=np.float64),
+        embeddings=np.asarray(rows_embedding, dtype=np.float64),
+        posterior=np.asarray(rows_posterior, dtype=np.float64),
+        predicted_labels=np.asarray(rows_label, dtype=np.int64),
+        boxes=np.asarray(rows_box, dtype=np.float64),
+        objectness=np.asarray(rows_objectness, dtype=np.float64),
+    )
+    return export_path, splits_dir / "debug_edge.txt"
 
 
 TEST_MODE = ExecutionMode(
@@ -381,7 +504,7 @@ def test_zero_tail_pilot_fails_before_the_ablation(
     assert "pilot ablation was not started" in message
 
 
-def test_zero_tail_debug_pilot_is_deterministically_stratified(
+def test_zero_tail_evaluation_grouped_debug_pilot_uses_pilot_tail(
     fixture_paths: tuple[Path, Path, Path],
 ) -> None:
     root, export, split = fixture_paths
@@ -391,6 +514,21 @@ def test_zero_tail_debug_pilot_is_deterministically_stratified(
         split,
         seed=0,
     )
+    config_study = replace(mode.study_config(), iou_threshold=config.iou_threshold)
+    evaluation = study.prepare_pool(
+        export=proposals,
+        annotations_dir=str(config.annotations_dir),
+        config=config_study,
+        restrict_to_images=splits["evaluation"],
+    )
+    evaluation_grouped_pilot = study.prepare_pool(
+        export=proposals,
+        annotations_dir=str(config.annotations_dir),
+        config=config_study,
+        restrict_to_images=splits["pilot"],
+        class_groups=evaluation.class_groups,
+    )
+    assert evaluation_grouped_pilot.targets.object_total("tail") == 0
 
     evaluation, pilot, _, _, updated = stage_pools(
         config,
@@ -400,7 +538,7 @@ def test_zero_tail_debug_pilot_is_deterministically_stratified(
         available_ids=available,
     )
 
-    assert updated != splits
+    assert updated == splits
     assert updated["evaluation"] == splits["evaluation"]
     assert len(updated["pilot"]) == mode.pilot_images
     assert len(updated["reference"]) == mode.reference_images
@@ -441,6 +579,61 @@ def test_valid_pilot_split_is_left_unchanged(
 
     assert updated == splits
     assert pilot.targets.object_total("tail") >= 1
+
+
+def test_debug_pipeline_reaches_stage_nine_with_pilot_only_tail_classes(tmp_path: Path) -> None:
+    root = tmp_path / "edge"
+    export, split = build_pilot_grouping_edge_fixture(root)
+    config_module.load_config()
+    original_debug = config_module.resolve_mode("DEBUG")
+    debug_mode = ExecutionMode(
+        name="DEBUG",
+        description="Regression mode for pilot-local tail grouping.",
+        evaluation_images=8,
+        pilot_images=3,
+        reference_images=4,
+        per_image_limit=8,
+        budgets=(2, 4),
+        rounds=1,
+        seeds=(0,),
+        strategies=PRIMARY_STRATEGIES,
+        imbalance_settings=longtail.FLATTENING_IMBALANCE_SETTINGS,
+        run_pilot=True,
+        run_ablations=False,
+        ablation_seeds=(0,),
+        reference_limit=100,
+        runtime_budget_seconds=5 * 60,
+        research_grade=False,
+    )
+    progress: list[str] = []
+    try:
+        config_module.register(debug_mode, replace_existing=True)
+        result = run_pipeline(
+            PipelineConfig(
+                mode="DEBUG",
+                data_root=str(root),
+                split_file=str(split),
+                existing_export=str(export),
+                output_dir=str(tmp_path / "debug_result"),
+                cache_dir=str(tmp_path / "debug_cache"),
+                require_gpu=False,
+                seed=0,
+                target_tail_recall=0.25,
+            ),
+            progress=progress.append,
+        )
+    finally:
+        config_module.register(original_debug, replace_existing=True)
+
+    assert any("[9/11] Cost estimate" in line for line in progress)
+    assert result.pilot["chosen_coherence_method"] in {
+        "relative_within_cluster",
+        "radius_core",
+    }
+    assert all(int(row["tail_objects_reachable"]) > 0 for row in result.pilot["pilot_rows"])
+    assert any(
+        "pilot stratification moved none; reachable tail before=" in line for line in progress
+    )
 
 
 def test_runtime_plan_is_recorded_with_a_verdict(completed_run) -> None:

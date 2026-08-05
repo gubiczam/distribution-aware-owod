@@ -638,6 +638,7 @@ def run_ablations(
         prepared.table, spec=setting, seed=0, class_groups=prepared.class_groups.groups
     )
     scoped = restrict(prepared, severity.keep_mask)
+    tail_denominator = scoped.targets.object_total("tail")
     budgets = longtail.resolve_budgets(config.budgets, pool_size=scoped.size)
     total = max(budgets)
     references = np.asarray(reference_embeddings, dtype=np.float64)
@@ -670,11 +671,21 @@ def run_ablations(
                 budgets=budgets,
                 isolated=isolated,
             )
+            summary = discovery.auc_summary(curve)
+            if tail_denominator == 0:
+                tail_auc_reason = f"NaN: tail denominator is zero after {setting.name} severity"
+            elif "tail_discovery_auc" not in summary:
+                tail_values = [row.get("tail_discovery_recall") for row in curve]
+                tail_auc_reason = f"NaN: tail recall curve contains {tail_values}"
+            else:
+                tail_auc_reason = "finite"
             rows.append(
                 {
                     "ablation": spec.name,
                     "seed": seed,
                     "imbalance_setting": setting.name,
+                    "tail_objects_reachable": tail_denominator,
+                    "tail_auc_reason": tail_auc_reason,
                     "gate_form": _gate_form(spec),
                     # gamma is the *total* weight on the distribution term, so the
                     # three gate forms are comparable at equal gamma: the additive
@@ -686,7 +697,7 @@ def run_ablations(
                     "coherence_method": spec.coherence_method,
                     "neighbour_count": spec.neighbour_count,
                     "coherence_exponent": spec.coherence_exponent,
-                    **discovery.auc_summary(curve),
+                    **summary,
                 }
             )
     return rows
@@ -742,6 +753,19 @@ def select_hyperparameters(
     )
     if not rows:
         raise StudyError("The pilot produced no ablation rows.")
+    if progress is not None:
+        progress("pilot hyperparameter diagnostics:")
+        for row in rows:
+            denominator = int(row.get("tail_objects_reachable", 0))
+            auc = row.get("tail_discovery_auc")
+            reason = row.get("tail_auc_reason", "not recorded")
+            progress(
+                "  "
+                f"{row.get('ablation')} / seed {row.get('seed')}: "
+                f"tail denominator={denominator}, "
+                f"tail_discovery_auc={auc if auc is not None else 'NaN'}, "
+                f"reason={reason}"
+            )
 
     def rank_key(row: Mapping[str, object]) -> tuple[float, float, str]:
         # A missing or NaN objective must sort *last*, not participate in an

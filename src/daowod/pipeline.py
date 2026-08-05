@@ -587,7 +587,11 @@ def _reachable_images(prepared: PreparedPool, *, group: str) -> set[str]:
     """Images containing at least one reachable object in ``group``."""
 
     images: set[str] = set()
-    selected = prepared.table.gt_is_unknown & (prepared.table.gt_group == group)
+    selected = (
+        prepared.table.gt_is_unknown
+        if group == "all"
+        else prepared.table.gt_is_unknown & (prepared.table.gt_group == group)
+    )
     for object_index in prepared.table.gt_object_index[selected].tolist():
         index = int(object_index)
         if index >= 0:
@@ -639,30 +643,49 @@ def _zero_tail_pilot_error(
     )
 
 
-def _swap_reference_tail_into_pilot(
+def _replace_in_split(
     *,
     splits: Mapping[str, Sequence[str]],
-    reference: PreparedPool,
-) -> dict[str, list[str]] | None:
-    """Deterministically move one reachable-tail reserve image into the pilot.
+    donor_pool: str,
+    donor: str,
+    replacement: str,
+) -> dict[str, list[str]]:
+    """Move ``donor`` into pilot and put ``replacement`` where it came from."""
 
-    Evaluation is left untouched. The displaced pilot image moves to the reference
-    reserve, so counts and disjointness stay fixed.
-    """
-
-    reference_tail = sorted(_reachable_images(reference, group="tail"))
-    if not reference_tail:
-        return None
-    donor = reference_tail[0]
-    replacement = sorted(str(value) for value in splits["pilot"])[0]
     updated = {name: sorted(str(value) for value in values) for name, values in splits.items()}
-    updated["reference"] = sorted(
-        replacement if image_id == donor else image_id for image_id in updated["reference"]
+    updated[donor_pool] = sorted(
+        replacement if image_id == donor else image_id for image_id in updated[donor_pool]
     )
     updated["pilot"] = sorted(
         donor if image_id == replacement else image_id for image_id in updated["pilot"]
     )
     return updated
+
+
+def _pilot_selection_config(mode: ExecutionMode) -> StudyConfig:
+    """The exact cheap study used by pilot hyperparameter selection."""
+
+    return replace(
+        mode.study_config(),
+        budgets=tuple(value for value in mode.budgets if value <= max(mode.budgets) // 2)
+        or (min(mode.budgets),),
+        seeds=(mode.seeds[0],),
+        imbalance_settings=(mode.imbalance_settings[-1],),
+    )
+
+
+def _pilot_tail_denominator_for_selection(
+    pilot: PreparedPool, mode: ExecutionMode
+) -> tuple[int, dict[str, object]]:
+    """Tail denominator after the pilot-selection severity has been applied."""
+
+    config_study = _pilot_selection_config(mode)
+    setting = config_study.imbalance_settings[0]
+    severity = longtail.build_long_tail_pool(
+        pilot.table, spec=setting, seed=0, class_groups=pilot.class_groups.groups
+    )
+    scoped = study.restrict(pilot, severity.keep_mask)
+    return scoped.targets.object_total("tail"), dict(severity.report)
 
 
 def _available_ids(config: PipelineConfig) -> list[str]:
@@ -762,6 +785,7 @@ def stage_pools(
     export: Mapping[str, NDArray[np.generic]],
     splits: Mapping[str, Sequence[str]],
     available_ids: Sequence[str],
+    progress: Progress | None = None,
 ) -> tuple[
     PreparedPool,
     PreparedPool | None,
@@ -779,6 +803,16 @@ def stage_pools(
 
     config_study = mode.study_config()
     config_study = replace(config_study, iou_threshold=config.iou_threshold)
+
+    def prepare(name: str, class_groups: ClassGroups | None = None) -> PreparedPool:
+        return study.prepare_pool(
+            export=export,
+            annotations_dir=str(config.annotations_dir),
+            config=config_study,
+            restrict_to_images=list(updated_splits[name]),
+            class_groups=class_groups,
+        )
+
     evaluation = study.prepare_pool(
         export=export,
         annotations_dir=str(config.annotations_dir),
@@ -788,27 +822,37 @@ def stage_pools(
     updated_splits = {
         name: sorted(str(value) for value in values) for name, values in splits.items()
     }
+    reference_probe = prepare("reference", evaluation.class_groups)
+    pilot_grouping = evaluation.class_groups if mode.research_grade else None
     pilot = None
     if mode.run_pilot and splits.get("pilot"):
-        pilot = study.prepare_pool(
-            export=export,
-            annotations_dir=str(config.annotations_dir),
-            config=config_study,
-            restrict_to_images=list(updated_splits["pilot"]),
-            class_groups=evaluation.class_groups,
+        pilot = prepare("pilot", pilot_grouping)
+    _log(progress, "  reachable unknown objects after candidate filtering:")
+    _log(progress, f"    reference: {_reachable_object_counts(reference_probe)}")
+    if pilot is not None:
+        _log(progress, f"    pilot: {_reachable_object_counts(pilot)}")
+    else:
+        _log(progress, "    pilot: skipped")
+    _log(progress, f"    evaluation: {_reachable_object_counts(evaluation)}")
+
+    if pilot is not None:
+        before_tail, before_report = _pilot_tail_denominator_for_selection(pilot, mode)
+        _log(
+            progress,
+            "  pilot tail denominator for hyperparameter selection before stratification: "
+            f"{before_tail} ({before_report.get('setting')})",
         )
-        if pilot.targets.object_total("tail") == 0:
-            reference_probe = study.prepare_pool(
-                export=export,
-                annotations_dir=str(config.annotations_dir),
-                config=config_study,
-                restrict_to_images=list(updated_splits["reference"]),
-                class_groups=evaluation.class_groups,
-            )
+        if before_tail == 0:
             tail_images = (
-                _reachable_images(reference_probe, group="tail")
-                | _reachable_images(evaluation, group="tail")
-                | _reachable_images(pilot, group="tail")
+                _reachable_images(
+                    reference_probe,
+                    group="tail" if mode.research_grade else "all",
+                )
+                | _reachable_images(
+                    evaluation,
+                    group="tail" if mode.research_grade else "all",
+                )
+                | _reachable_images(pilot, group="tail" if mode.research_grade else "all")
             )
             minimum = _minimum_pilot_size_for_tail(
                 mode=mode,
@@ -824,34 +868,88 @@ def stage_pools(
                     detail="Reportable modes keep the declared protocol unchanged; "
                     "choose a protocol whose declared pilot reaches the tail.",
                 )
-            repaired = _swap_reference_tail_into_pilot(
-                splits=updated_splits,
-                reference=reference_probe,
-            )
-            if repaired is None:
+
+            moved: tuple[str, str, str] | None = None
+            pilot_replacements = sorted(str(value) for value in updated_splits["pilot"])
+            donor_pools = {
+                "reference": sorted(
+                    _reachable_images(
+                        reference_probe,
+                        group="tail" if mode.research_grade else "all",
+                    )
+                ),
+                "evaluation": sorted(
+                    _reachable_images(
+                        evaluation,
+                        group="tail" if mode.research_grade else "all",
+                    )
+                ),
+            }
+            for donor_pool, donors in donor_pools.items():
+                for donor in donors:
+                    for replacement in pilot_replacements:
+                        candidate = _replace_in_split(
+                            splits=updated_splits,
+                            donor_pool=donor_pool,
+                            donor=donor,
+                            replacement=replacement,
+                        )
+                        candidate_evaluation = study.prepare_pool(
+                            export=export,
+                            annotations_dir=str(config.annotations_dir),
+                            config=config_study,
+                            restrict_to_images=list(candidate["evaluation"]),
+                        )
+                        candidate_pilot = study.prepare_pool(
+                            export=export,
+                            annotations_dir=str(config.annotations_dir),
+                            config=config_study,
+                            restrict_to_images=list(candidate["pilot"]),
+                            class_groups=(
+                                candidate_evaluation.class_groups if mode.research_grade else None
+                            ),
+                        )
+                        after_tail, _ = _pilot_tail_denominator_for_selection(candidate_pilot, mode)
+                        if after_tail > 0:
+                            updated_splits = candidate
+                            evaluation = candidate_evaluation
+                            reference_probe = study.prepare_pool(
+                                export=export,
+                                annotations_dir=str(config.annotations_dir),
+                                config=config_study,
+                                restrict_to_images=list(updated_splits["reference"]),
+                                class_groups=evaluation.class_groups,
+                            )
+                            pilot = candidate_pilot
+                            moved = (donor_pool, donor, replacement)
+                            break
+                    if moved is not None:
+                        break
+                if moved is not None:
+                    break
+
+            after_tail, _ = _pilot_tail_denominator_for_selection(pilot, mode)
+            if moved is None or after_tail == 0:
                 raise _zero_tail_pilot_error(
                     pilot=pilot,
                     mode=mode,
                     minimum_suggested_pilot_size=minimum,
-                    detail="No reachable tail object is available in the reference "
-                    "reserve for deterministic stratification.",
+                    detail="No count-preserving deterministic stratification found a "
+                    "pilot with an evaluable tail denominator.",
                 )
-            updated_splits = repaired
-            pilot = study.prepare_pool(
-                export=export,
-                annotations_dir=str(config.annotations_dir),
-                config=config_study,
-                restrict_to_images=list(updated_splits["pilot"]),
-                class_groups=evaluation.class_groups,
+            source, donor, replacement = moved
+            _log(
+                progress,
+                "  pilot stratification moved "
+                f"{donor} from {source} to pilot; moved {replacement} from pilot "
+                f"to {source}; reachable tail before={before_tail}, after={after_tail}",
             )
-            if pilot.targets.object_total("tail") == 0:
-                raise _zero_tail_pilot_error(
-                    pilot=pilot,
-                    mode=mode,
-                    minimum_suggested_pilot_size=minimum,
-                    detail="Deterministic pilot stratification did not recover a "
-                    "reachable tail denominator.",
-                )
+        else:
+            _log(
+                progress,
+                "  pilot stratification moved none; "
+                f"reachable tail before={before_tail}, after={before_tail}",
+            )
     reference_ids = {str(value) for value in updated_splits["reference"]}
     ids = np.asarray([str(value) for value in export["image_ids"].tolist()], dtype=object)
     keep = np.array([str(value) in reference_ids for value in ids.tolist()], dtype=np.bool_)
@@ -902,14 +1000,23 @@ def stage_pilot(
 ) -> dict[str, object]:
     """Choose the coherence definition on the pilot pool, never on the reported one."""
 
-    config_study = replace(
-        mode.study_config(),
-        # A cheap grid: the pilot's only job is to fix one configuration.
-        budgets=tuple(value for value in mode.budgets if value <= max(mode.budgets) // 2)
-        or (min(mode.budgets),),
-        seeds=(mode.seeds[0],),
-        imbalance_settings=(mode.imbalance_settings[-1],),
+    counts = _reachable_object_counts(pilot)
+    _log(
+        progress,
+        "  pilot before select_hyperparameters: "
+        f"images={len(set(str(value) for value in pilot.pool.image_ids.tolist()))}, "
+        f"candidates={pilot.size}, "
+        f"reachable head={counts['head']}, "
+        f"reachable medium={counts['medium']}, "
+        f"reachable tail={counts['tail']}",
     )
+    selection_tail, selection_report = _pilot_tail_denominator_for_selection(pilot, mode)
+    _log(
+        progress,
+        "  pilot selection denominator after "
+        f"{selection_report.get('setting')} severity: tail={selection_tail}",
+    )
+    config_study = _pilot_selection_config(mode)
     return study.select_hyperparameters(
         pilot=pilot,
         reference_embeddings=bank,
@@ -1100,6 +1207,9 @@ def run_pipeline(
         "  reference/pilot/evaluation images: "
         + "/".join(str(len(splits[name])) for name in ("reference", "pilot", "evaluation")),
     )
+    _log(progress, f"  reference ids: {list(splits['reference'])}")
+    _log(progress, f"  pilot ids: {list(splits['pilot'])}")
+    _log(progress, f"  evaluation ids: {list(splits['evaluation'])}")
     result.stage_seconds["splits"] = round(time.time() - stage_started, 1)
 
     _log(progress, "[3/11] Detector rate probe and export projection")
@@ -1148,6 +1258,7 @@ def run_pipeline(
         export=export,
         splits=splits,
         available_ids=available,
+        progress=progress,
     )
     state.save(f"splits_{config.fingerprint()}", dict(splits))
     result.pool_report = dict(evaluation.pool_report)
