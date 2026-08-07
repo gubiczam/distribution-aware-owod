@@ -14,22 +14,11 @@ only the bridge-exported pool can answer.
 
 import numpy as np
 import pytest
+from fixtures import simulate_pool, structured_regime_pool
 
 from daowod import components
-from daowod.diagnostics import (
-    LeakageError,
-    assert_no_ground_truth,
-    cohens_d,
-    coherence_regime,
-    component_diagnostics,
-    join_ground_truth,
-    proposal_table,
-    spearman,
-    uncertainty_comparison,
-)
-from daowod.groups import ClassGroups
-from daowod.scoring import STRATEGY_REGISTRY, score_pool, select_images
-from daowod.simulation import simulate_pool, structured_regime_pool
+from daowod.oracle import LeakageError, assert_no_ground_truth
+from daowod.scoring import STRATEGY_REGISTRY, score_pool
 
 # One well-formed tail class (6 proposals), one big head class, plus genuinely
 # isolated proposals. Every class has the same intra-class spread.
@@ -169,7 +158,7 @@ def test_every_cluster_size_regime_produces_finite_defined_values(
 def test_rarity_is_continuous_not_a_singleton_indicator() -> None:
     """S4: under rank normalisation rarity must grade, not flag."""
 
-    from daowod.normalisation import normalise
+    from daowod.components import normalise
 
     counts = (120, 60, 30, 12, 6, 3, 1)
     embeddings, labels, _ = structured_regime_pool(proposals_per_class=counts, seed=4)
@@ -187,7 +176,7 @@ def test_rarity_is_continuous_not_a_singleton_indicator() -> None:
 
 
 def test_all_rarity_methods_agree_under_rank_normalisation() -> None:
-    from daowod.normalisation import normalise
+    from daowod.components import normalise
 
     _, labels, _ = structured_regime_pool(proposals_per_class=(50, 20, 8, 2), seed=5)
     ranked = [
@@ -204,7 +193,7 @@ def test_all_rarity_methods_agree_under_rank_normalisation() -> None:
 def test_gate_promotes_rare_and_coherent_over_rare_and_isolated() -> None:
     """The whole point of Contribution A, tested directly."""
 
-    spec = STRATEGY_REGISTRY.resolve("v2:rarity_coherence")
+    spec = STRATEGY_REGISTRY.resolve("rarity_coherence")
     result = score_pool(
         spec=spec,
         image_ids=IMAGE_IDS,
@@ -216,7 +205,7 @@ def test_gate_promotes_rare_and_coherent_over_rare_and_isolated() -> None:
     )
     # Use the true partition so the test isolates the gate, not KMeans.
     scored = score_pool(
-        spec=STRATEGY_REGISTRY.resolve("v2:rarity_coherence").__class__(
+        spec=STRATEGY_REGISTRY.resolve("rarity_coherence").__class__(
             **{**spec.as_dict(), "pseudo_label_source": "predicted"}
         ),
         image_ids=IMAGE_IDS,
@@ -243,7 +232,7 @@ def test_gate_promotes_rare_and_coherent_over_rare_and_isolated() -> None:
 
 
 def test_frequent_and_isolated_is_not_promoted() -> None:
-    spec = STRATEGY_REGISTRY.resolve("v2:full")
+    spec = STRATEGY_REGISTRY.resolve("full")
     result = score_pool(
         spec=spec.__class__(**{**spec.as_dict(), "pseudo_label_source": "predicted"}),
         image_ids=IMAGE_IDS,
@@ -263,156 +252,7 @@ def test_frequent_and_isolated_is_not_promoted() -> None:
 POOL = simulate_pool(class_count=12, largest_class_images=12, proposals_per_image=8, seed=11)
 
 
-def _pool_result(strategy: str = "v2:full"):
-    return score_pool(
-        spec=STRATEGY_REGISTRY.resolve(strategy),
-        image_ids=POOL.image_ids,
-        embeddings=POOL.embeddings,
-        reference_embeddings=POOL.reference_embeddings,
-        confidence=POOL.confidence,
-        posterior=POOL.posterior,
-        predicted_labels=POOL.predicted_labels,
-        seed=0,
-        compute_all_components=True,
-    )
-
-
-def test_coherence_regime_classifier_recognises_each_regime() -> None:
-    sizes = np.array([100.0] * 50 + [2.0] * 50)
-    assert coherence_regime(np.full(100, 0.5), sizes)["regime"] == "inactive"
-    confounded = np.concatenate([np.full(50, 0.9), np.full(50, 0.1)])
-    assert coherence_regime(confounded, sizes)["regime"] == "frequency_confounded"
-    rng = np.random.default_rng(0)
-    independent = rng.uniform(0.0, 1.0, 100)
-    assert coherence_regime(independent, rng.permutation(sizes))["regime"] in {
-        "informative",
-        "frequency_confounded",
-    }
-
-
-def test_component_diagnostics_reports_every_required_field() -> None:
-    result = _pool_result()
-    groups = ClassGroups.from_mapping(
-        {
-            row["class_name"]: row["group"]  # type: ignore[index]
-            for row in POOL.class_stats_rows()
-        },
-        source="simulated",
-    )
-    report = component_diagnostics(
-        result,
-        budget=5,
-        image_classes=POOL.image_classes,
-        class_groups=groups,
-        unknown_classes=list(POOL.class_image_counts),
-    )
-    for component in ("uncertainty", "rarity", "coherence", "gated"):
-        assert "mean" in report[f"raw_{component}"]
-        assert "q50" in report[f"norm_{component}"]
-        assert report[f"histogram_norm_{component}"]["counts"]
-    assert set(report["by_cluster_size_regime"]) == {
-        "singleton",
-        "2_to_3",
-        "4_to_5",
-        "6_or_more",
-    }
-    assert "rarity_vs_coherence" in report["correlations"]
-    assert report["coherence_regime"]["regime"] in {
-        "informative",
-        "frequency_confounded",
-        "saturated",
-        "inactive",
-    }
-    assert "selected_image_jaccard" in report["gate_impact"]
-    assert set(report["by_ground_truth_group"]) >= {"head", "medium", "tail"}
-
-
-def test_uncertainty_comparison_detects_the_legacy_identity() -> None:
-    """The legacy transform must be flagged as monotone; entropy must not be."""
-
-    report = uncertainty_comparison(
-        posterior=POOL.posterior,
-        confidence=POOL.confidence,
-        image_ids=POOL.image_ids,
-        budget=6,
-    )
-    legacy = report["methods"]["legacy_prob_score"]
-    entropy = report["methods"]["entropy"]
-
-    # 1 - |2c - 1| equals 2c for every c < 0.5, so it is monotone in the unknown
-    # score except for the handful of proposals that cross the fold at c = 0.5.
-    # In this pool 3 of 384 proposals do, giving 0.99998 rather than exactly 1.
-    above_fold = float((POOL.confidence > 0.5).mean())
-    assert above_fold < 0.02
-    assert legacy["spearman_with_unknown_score"] > 0.999
-    assert legacy["is_monotone_in_unknown_score"] is True
-
-    assert entropy["is_monotone_in_unknown_score"] is False
-    assert abs(entropy["spearman_with_unknown_score"]) < 0.999
-    assert "carries ranking information" in report["verdict"]
-
-
-def test_cohens_d_and_spearman_behave_sanely() -> None:
-    rng = np.random.default_rng(0)
-    a, b = rng.normal(1.0, 1.0, 200), rng.normal(0.0, 1.0, 200)
-    assert cohens_d(a, b) > 0.7
-    assert spearman(np.arange(10.0), np.arange(10.0)) == pytest.approx(1.0)
-    assert spearman(np.arange(10.0), -np.arange(10.0)) == pytest.approx(-1.0)
-    assert np.isnan(cohens_d([1.0], [2.0]))
-    assert np.isnan(spearman([1.0, 1.0], [2.0, 2.0]))
-
-
 # --- Step 9: proposal records and the leakage guard --------------------------
-
-
-def test_proposal_table_is_complete_and_ground_truth_free() -> None:
-    result = _pool_result()
-    chosen = select_images(result.image_scores, budget=4)
-    rows = proposal_table(
-        result,
-        run_id="test-run",
-        seed=0,
-        round_index=1,
-        selected_image_ids=chosen,
-        posterior=POOL.posterior,
-        confidence=POOL.confidence,
-        predicted_labels=POOL.predicted_labels,
-    )
-    assert len(rows) == result.proposal_count
-    required = {
-        "run_id",
-        "seed",
-        "round",
-        "strategy",
-        "image_id",
-        "proposal_index",
-        "predicted_class_index",
-        "cluster_id",
-        "cluster_size",
-        "posterior_entropy",
-        "posterior_max",
-        "posterior_margin",
-        "unknown_score",
-        "raw_uncertainty",
-        "norm_uncertainty",
-        "raw_novelty",
-        "norm_novelty",
-        "raw_rarity",
-        "norm_rarity",
-        "raw_coherence",
-        "norm_coherence",
-        "raw_gated",
-        "norm_gated",
-        "proposal_score",
-        "image_score",
-        "proposal_selected",
-        "image_selected",
-        "isolated_outlier",
-    }
-    assert required <= set(rows[0])
-    assert_no_ground_truth(rows)
-    assert sum(1 for row in rows if row["image_selected"]) > 0
-    assert sum(1 for row in rows if row["proposal_selected"]) == 4 * result.spec.top_k
 
 
 def test_leakage_guard_rejects_ground_truth_in_acquisition_artifacts() -> None:
@@ -421,33 +261,6 @@ def test_leakage_guard_rejects_ground_truth_in_acquisition_artifacts() -> None:
         assert_no_ground_truth(rows)
     with pytest.raises(LeakageError):
         assert_no_ground_truth([{"image_id": "a", "true_class": "sofa"}])
-
-
-def test_post_hoc_join_adds_ground_truth_and_tags_the_stage() -> None:
-    result = _pool_result()
-    chosen = select_images(result.image_scores, budget=4)
-    rows = proposal_table(result, run_id="r", seed=0, round_index=1, selected_image_ids=chosen)
-    groups = ClassGroups.from_mapping(
-        {row["class_name"]: row["group"] for row in POOL.class_stats_rows()},  # type: ignore[index]
-        source="simulated",
-    )
-    joined = join_ground_truth(
-        rows,
-        image_classes=POOL.image_classes,
-        class_groups=groups,
-        unknown_classes=list(POOL.class_image_counts),
-    )
-    assert all(row["analysis_stage"] == "post_hoc" for row in joined)
-    assert any(row["gt_has_tail"] for row in joined)
-    assert all(row["gt_classes"] for row in joined)
-    # Joining twice must be refused: the guard runs on the input.
-    with pytest.raises(LeakageError):
-        join_ground_truth(
-            joined,
-            image_classes=POOL.image_classes,
-            class_groups=groups,
-            unknown_classes=list(POOL.class_image_counts),
-        )
 
 
 def test_simulator_is_deterministic_and_pins_its_calibration() -> None:
